@@ -33,7 +33,7 @@ code{background:rgba(255,255,255,.08);border-radius:6px;padding:1px 6px;font-siz
 <body>
 <div class="wrap">
   <div class="brand"><img src="../icon128.png" alt=""><b>Hunt<i>ToList</i></b><span>Sheet setup · ~10 minutes</span></div>
-  <h1>Your research sheet, in six small steps</h1>
+  <h1>Your research sheet, in seven small steps</h1>
   <p class="lead">HuntToList files everything into a Google Sheet <b style="color:#e8eef7">you own</b> — there is no HuntToList server. One script, pasted once, turns a blank sheet into the whole pipeline.</p>
 
   <div class="step"><h2><span class="n">1</span>Create a blank sheet</h2>
@@ -57,16 +57,33 @@ code{background:rgba(255,255,255,.08);border-radius:6px;padding:1px 6px;font-siz
 
   <div class="step"><h2><span class="n">4</span>Deploy as a web app</h2>
     <ol>
-      <li><b>Deploy → New deployment</b> → ⚙ Select type → <b>Web app</b>.</li>
-      <li><i>Execute as</i> <b>Me</b> · <i>Who has access</i> <b>Anyone</b>.</li>
-      <li><b>Deploy</b>, then copy the <b>Web app URL</b> (<code>…/exec</code>).</li>
+      <li>Still in the Apps Script editor, click the blue <b>Deploy</b> button (top-right) → <b>New deployment</b>.</li>
+      <li>In the dialog, click the <b>⚙ gear</b> next to “Select type” and choose <b>Web app</b>.</li>
+      <li>Fill the three fields:<br>· <i>Description</i> — anything, e.g. <code>HuntToList</code><br>· <i>Execute as</i> — <b>Me (your email)</b><br>· <i>Who has access</i> — <b>Anyone</b> ← this one matters</li>
+      <li>Click <b>Deploy</b>. If Google asks to authorise again: <b>Authorise access</b> → your account → <b>Advanced</b> → <b>Go to … (unsafe)</b> → <b>Allow</b>.</li>
+      <li>You'll see two URLs. Copy the <b>Web app</b> one — it ends in <code>/exec</code> — with the <b>Copy</b> button under it. Then click <b>Done</b>.</li>
     </ol>
-    <p class="note">The URL is a long secret. For a second lock, set <code>api_token</code> on the sheet's Settings tab and the same value in the extension's <i>Pipeline token</i>.</p></div>
+    <p class="note">“Anyone” does not expose your sheet: the URL contains a long random secret, and only someone holding the exact URL can reach the script. Step 6 adds a second lock on top.</p></div>
 
   <div class="step"><h2><span class="n">5</span>Connect the extension</h2>
-    <p>Extension icon → <b>⚙ Settings</b> → paste the URL into <b>Pipeline URL</b> → <b>Test connection</b>. Expect: <i>“Connected — HuntToList pipeline v90”</i>. Save.</p></div>
+    <ol>
+      <li>In Chrome, click the <b>HuntToList icon</b> in the toolbar (pin it via the 🧩 puzzle icon if hidden).</li>
+      <li>Click the <b>⚙ gear</b> at the top of the popup — the Settings page opens.</li>
+      <li>Go to the <b>Pipeline</b> section and paste your <code>/exec</code> URL into <b>Pipeline URL</b>.</li>
+      <li>Click <b>Test connection</b>. Expect: <i>“Connected — HuntToList pipeline v90”</i>.</li>
+      <li>Click <b>Save settings</b> (bottom-left).</li>
+    </ol></div>
 
-  <div class="step"><h2><span class="n">6</span>Tune it (optional)</h2>
+  <div class="step"><h2><span class="n">6</span>Add the token lock (recommended)</h2>
+    <p>One secret typed in two places — after this, requests without it are refused even if someone got your URL.</p>
+    <ol>
+      <li>Open your Google Sheet → click the <b>Settings</b> tab at the bottom.</li>
+      <li>Find the <code>api_token</code> row and type any secret in its value cell, e.g. <code>hunter-2026-kite</code>.</li>
+      <li>Back in the extension's <b>⚙ Settings → Pipeline</b>, paste the <b>same secret</b> into <b>Pipeline token</b>.</li>
+      <li><b>Test connection</b> again (should still say Connected), then <b>Save settings</b>.</li>
+    </ol></div>
+
+  <div class="step"><h2><span class="n">7</span>Tune it (optional)</h2>
     <p>The sheet's <b>Settings</b> tab controls winner-alert emails, your eBay fee model (business or private, category fee %, VAT) — edit a cell and every winner row's profit recomputes live.</p></div>
 
   <p class="foot">Upgrading later: paste the new script over the old → Save → <b>Run ▶ formatSheets</b> → <b>Deploy → Manage deployments → ✏️ → New version</b>.<br>
