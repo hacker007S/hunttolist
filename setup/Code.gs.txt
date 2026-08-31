@@ -1,0 +1,2241 @@
+/**
+ * HuntToList backend v90 — Google Apps Script web app bound to the research sheet.
+ * (the version the API reports lives in doGet: search "service:")
+ *
+ * Tabs: "Amazon Hunting", "AliExpress Hunting", "eBay Hunting" (ideas per
+ * source, Terapeak verdicts written back, rejected rows red), "Hunted Verified"
+ * (winners with live economics), "Settings" (alerts, fee rates, API token).
+ * Values are placed by header NAME (never position); missing columns
+ * self-append. Rows dedupe by slug, URL and niche keyword across ALL tabs.
+ *
+ * Entry points: doPost (candidates + verdicts), doGet (ideas / winners /
+ * suppliers / rows / layout), formatSheets (Run ▶ once after pasting a new
+ * version), setupTriggers (Run ▶ once for the Monday retro email), onEdit.
+ * History: docs/CHANGELOG-backend.md.
+ */
+
+// Per-source schemas: every tab carries only the columns its source fills.
+// hunting tabs: identity -> the source's own numbers -> screening -> Terapeak
+var HUNT_LEFT = ['date', 'source', 'slug', 'main_keyword', 'title', 'url'];
+var HUNT_RIGHT = ['generic', 'safety_verdict', 'notes'];
+var SOURCE_EXTRA = {
+  'Amazon Hunting': ['price_gbp', 'fulfillment', 'amazon_monthly_sold', 'reviews', 'rating_stars'],
+  'AliExpress Hunting': ['supplier_cost_gbp', 'lane', 'reviews', 'rating_stars'],
+  'eBay Hunting': ['price_gbp', 'reviews'],
+};
+// Terapeak block on the hunting tabs (v72 order): the verdict first, then the
+// one-number summary, then the raw evidence. Every column is one fact —
+// "Niche £/mo" (avg x sold) was the same story as Terapeak's own "Sales £
+// (30d)" and "Successful %" could no longer be measured, so both are gone.
+var TP_BLOCK = [
+  'status', 'model', 'failure_mode',
+  'score', 'trend', 'velocity',
+  'volume_price_gbp', 'units_30d', 'units_90d', 'str_30d_pct', 'str_90d_pct',
+  'sellers_broad', 'total_sales_gbp', 'top5_sold', 'active_listings', 'listings_removed',
+];
+
+// Sheet header LABELS (display) for internal field names — Terapeak block
+// uses the exact wording Terapeak shows; source quirks get honest names.
+// Every managed column has a display label (v72) — no raw internal names on
+// the sheet. Labels must be unique: fieldFor_ maps a header back by label.
+var FIELD_LABELS = {
+  // identity
+  date: 'Date',
+  date_validated: 'Date validated',
+  source: 'Source',
+  slug: 'Slug',
+  main_keyword: 'Main keyword',
+  model: 'Model',
+  title: 'Title',
+  url: 'URL',
+  source_url: 'Source URL',
+  supplier_url: 'Supplier URL',
+  lane: 'Lane',
+  generic: 'Generic',
+  safety_verdict: 'Safety',
+  notes: 'Notes',
+  // hunt data
+  price_gbp: 'Price £',
+  supplier_cost_gbp: 'Cost £',
+  fulfillment: 'Fulfilment',
+  amazon_monthly_sold: 'Amazon monthly sold',
+  reviews: 'Reviews',
+  rating_stars: 'Rating ★',
+  // economics (winners)
+  postage_cost_gbp: 'Postage £',
+  ebay_fee_gbp: 'eBay fee £',
+  ad_percent: 'Ad %',
+  ad_cost_gbp: 'Ad cost £',
+  profit_gbp: 'Profit £',
+  margin_pct: 'ROI %',
+  // Terapeak verdict + evidence
+  status: 'Verdict',
+  failure_mode: 'Reject reason',
+  score: 'Score',
+  trend: 'Trend',
+  velocity: 'Velocity',
+  volume_price_gbp: 'Avg sold price £',
+  units_30d: 'Total sold (30d)',
+  units_90d: 'Total sold (90d)',
+  str_30d_pct: 'Sell-through 30d',
+  str_90d_pct: 'Sell-through 90d',
+  sellers_broad: 'Total sellers',
+  total_sales_gbp: 'Sales £ (30d)',
+  top5_sold: 'Top 5 listings sold',
+  active_listings: 'Active listings',
+  listings_removed: 'Removed (90d)',
+  listing_status: 'Listing status',
+  // retired columns — labels kept so old headers still resolve and get pruned
+  str_pct: 'Sell-through %',
+  niche_revenue_gbp: 'Niche £/mo',
+  successful_pct: 'Successful %',
+  item_type: 'Type',
+  ebay_title: 'Title (max 80)',
+  date_ready: 'Date ready',
+};
+var TAB_FIELD_LABELS = {
+  'AliExpress Hunting': { reviews: 'Orders' },
+  'eBay Hunting': { reviews: 'Sold (lifetime)' },
+  'Hunted Verified': { ebay_price_gbp: 'Sell price £' },
+};
+// headers written by earlier versions — resolved so a rename never leaves an
+// orphan column behind (headerMap_ would otherwise append a fresh twin)
+var LEGACY_LABELS = {
+  'eBay Avg price': 'ebay_price_gbp',
+  'Total sales £ (30d)': 'total_sales_gbp',
+  'Top 5 sold': 'top5_sold',
+  'Avg sold price': 'volume_price_gbp',
+  'orders': 'reviews',
+  'sold (lifetime)': 'reviews',
+};
+
+function labelFor_(tabName, field) {
+  var tab = TAB_FIELD_LABELS[tabName] || {};
+  return tab[field] || FIELD_LABELS[field] || field;
+}
+// v78: one normalised lookup (case- and whitespace-insensitive). A header
+// retyped as "SLUG" or "Title " used to resolve to a new field, and
+// headerMap_ then appended an empty twin column on the very next request.
+var LABEL_INDEX_ = null;
+function normLabel_(x) {
+  return String(x).toLowerCase().replace(/[\s\u00a0]+/g, ' ').trim();
+}
+function labelIndex_(tabName) {
+  if (!LABEL_INDEX_) {
+    LABEL_INDEX_ = { '': {} };
+    var g = LABEL_INDEX_[''];
+    Object.keys(FIELD_LABELS).forEach(function (f) { g[normLabel_(FIELD_LABELS[f])] = f; g[normLabel_(f)] = f; });
+    Object.keys(LEGACY_LABELS).forEach(function (l) { g[normLabel_(l)] = LEGACY_LABELS[l]; });
+    Object.keys(TAB_FIELD_LABELS).forEach(function (t) {
+      LABEL_INDEX_[t] = {};
+      Object.keys(TAB_FIELD_LABELS[t]).forEach(function (f) { LABEL_INDEX_[t][normLabel_(TAB_FIELD_LABELS[t][f])] = f; });
+    });
+  }
+  return { tab: LABEL_INDEX_[tabName] || {}, all: LABEL_INDEX_[''] };
+}
+function fieldFor_(tabName, label) {
+  var key = normLabel_(label);
+  var ix = labelIndex_(tabName);
+  if (ix.tab[key]) return ix.tab[key];
+  if (ix.all[key]) return ix.all[key];
+  return String(label).trim(); // a user column keeps its own name
+}
+
+var LISTING_TAB = 'Hunted Verified';   // validated winners (was "Listing")
+function isListingLike_(name) { return name === LISTING_TAB; }
+
+// Ready to List mirrors the EBAY LISTING PAGE — no economics columns.
+
+// v12 layout: banner row 1 (merged group titles), headers row 2, data row 3+
+var HEADER_ROW = 2;
+
+// one source of truth: the Terapeak block, plus retired names so an old
+// column still sits under the Terapeak banner until it is pruned
+var TERAPEAK_COLS = {};
+TP_BLOCK.forEach(function (f) { TERAPEAK_COLS[f] = 1; });
+['str_pct', 'niche_revenue_gbp', 'successful_pct'].forEach(function (f) { TERAPEAK_COLS[f] = 1; });
+function isTerapeakCol_(tabName, header) {
+  return TERAPEAK_COLS[fieldFor_(tabName, header)] === 1;
+}
+// hunting tabs: banner colour + a lighter header tint per group (v72)
+var TAB_COLORS = {
+  'Amazon Hunting': '#fce5cd',
+  'AliExpress Hunting': '#f4cccc',
+  'eBay Hunting': '#d9ead3',
+};
+var TAB_TINTS = {
+  'Amazon Hunting': '#fdf2e9',
+  'AliExpress Hunting': '#fae8e8',
+  'eBay Hunting': '#ecf5ea',
+};
+var TAB_BANNER = {
+  'Amazon Hunting': '🛒 AMAZON DATA',
+  'AliExpress Hunting': '🧧 ALIEXPRESS DATA',
+  'eBay Hunting': '🏷️ EBAY DATA',
+};
+var TERAPEAK_COLOR = '#c9daf8';
+var TERAPEAK_TINT = '#e4ecfb';
+var TERAPEAK_BANNER = '📊 TERAPEAK VALIDATOR';
+
+/** Merged, coloured group titles in row 1, driven by the ACTUAL header order. */
+function formatBanner_(sh) {
+  var name = sh.getName();
+  var lastCol = Math.max(sh.getLastColumn(), 1);
+  // old banner merges can span MORE columns than today's lastCol — unmerge
+  // the entire first row or breakApart throws
+  var fullRow = sh.getRange(1, 1, 1, sh.getMaxColumns());
+  fullRow.breakApart();
+  fullRow.clearContent().setBackground(null);
+  var banner = sh.getRange(1, 1, 1, lastCol);
+  sh.setRowHeight(1, 55); // tall banner band
+  banner.setFontSize(13).setVerticalAlignment('middle');
+  if (isListingLike_(name)) {
+    // five colour-coded semantic groups; the header row tints to match.
+    // LISTING_HEADERS keeps each group's columns contiguous — v71 interleaved
+    // Terapeak and Score columns, which split the banner into striped bits
+    var WINNER_GROUPS = [
+      { label: '📦 PRODUCT', color: '#d9ead3', tint: '#eaf3e6',
+        fields: { date_validated: 1, slug: 1, main_keyword: 1, title: 1, source_url: 1, supplier_url: 1, lane: 1 } },
+      { label: '💰 ECONOMICS', color: '#ffe599', tint: '#fff2cc',
+        fields: { supplier_cost_gbp: 1, postage_cost_gbp: 1, ebay_price_gbp: 1, ebay_fee_gbp: 1,
+          ad_percent: 1, ad_cost_gbp: 1, profit_gbp: 1, margin_pct: 1 } },
+      { label: '🚀 SCORE & TREND', color: '#b4a7d6', tint: '#d9d2e9',
+        fields: { score: 1, trend: 1, velocity: 1 } },
+      { label: '📊 TERAPEAK EVIDENCE', color: '#a4c2f4', tint: '#cfe2f3',
+        fields: { units_30d: 1, units_90d: 1, str_30d_pct: 1, str_90d_pct: 1, sellers_broad: 1,
+          total_sales_gbp: 1, top5_sold: 1, active_listings: 1, listings_removed: 1 } },
+      { label: '📝 LISTING', color: '#f9cb9c', tint: '#fce5cd',
+        fields: { model: 1, listing_status: 1 } },
+    ];
+    var lh = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0].map(String);
+    var gidx = lh.map(function (h) {
+      var f = fieldFor_(LISTING_TAB, h);
+      for (var gi = 0; gi < WINNER_GROUPS.length; gi++) {
+        if (WINNER_GROUPS[gi].fields[f]) return gi;
+      }
+      return 0; // unknown columns ride with SOURCE
+    });
+    var ls = 0;
+    var lseen = {};
+    for (var lc = 1; lc <= lastCol; lc++) {
+      if (lc === lastCol || gidx[lc] !== gidx[ls]) {
+        var g = WINNER_GROUPS[gidx[ls]];
+        var lr = sh.getRange(1, ls + 1, 1, lc - ls);
+        if (lc - ls > 1) lr.merge();
+        // a group that reappears keeps its colour but not the text
+        lr.setValue(lseen[gidx[ls]] ? '' : g.label)
+          .setFontWeight('bold').setHorizontalAlignment('center')
+          .setBackground(g.color);
+        sh.getRange(HEADER_ROW, ls + 1, 1, lc - ls).setBackground(g.tint);
+        // bold section divider, full height of the tab
+        sh.getRange(1, ls + 1, Math.max(sh.getLastRow(), HEADER_ROW), lc - ls)
+          .setBorder(null, null, null, true, null, null, '#333333', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+        lseen[gidx[ls]] = true;
+        ls = lc;
+      }
+    }
+    sh.setFrozenRows(HEADER_ROW);
+    return;
+  }
+  var srcLabel = TAB_BANNER[name] || name.toUpperCase().replace(' HUNTING', ' DATA');
+  var hdrs = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0].map(String);
+  var groups = hdrs.map(function (h) {
+    return isTerapeakCol_(name, h) ? TERAPEAK_BANNER : srcLabel;
+  });
+  var start = 0;
+  for (var c = 1; c <= lastCol; c++) {
+    if (c === lastCol || groups[c] !== groups[start]) {
+      var isTp = groups[start] === TERAPEAK_BANNER;
+      var range = sh.getRange(1, start + 1, 1, c - start);
+      if (c - start > 1) range.merge();
+      sh.getRange(1, start + 1, Math.max(sh.getLastRow(), HEADER_ROW), c - start)
+        .setBorder(null, null, null, true, null, null, '#333333', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+      range.setValue(groups[start]).setFontWeight('bold')
+        .setHorizontalAlignment('center')
+        .setBackground(isTp ? TERAPEAK_COLOR : (TAB_COLORS[name] || '#efefef'));
+      // header row tinted to its group, like the winners tab (v72)
+      sh.getRange(HEADER_ROW, start + 1, 1, c - start)
+        .setBackground(isTp ? TERAPEAK_TINT : (TAB_TINTS[name] || '#f3f3f3'))
+        .setFontWeight('bold');
+      start = c;
+    }
+  }
+  sh.setFrozenRows(HEADER_ROW);
+}
+
+/** Shift every Terapeak column to the far right, in canonical order. */
+function organizeColumns_(sh) {
+  if (isListingLike_(sh.getName())) return;
+  var name2 = sh.getName();
+  var schema = {};
+  headersFor_(name2).forEach(function (h) { schema[h] = 1; });
+  var ALL_FIELDS = ['price_gbp', 'fulfillment', 'amazon_monthly_sold', 'reviews',
+                    'rating_stars', 'supplier_cost_gbp', 'lane'];
+  sh.getRange(1, 1, 1, sh.getMaxColumns()).breakApart();
+  // 1) rename known internal headers to their display labels; collect prunes
+  var hdrRange = sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn());
+  var hdrs0 = hdrRange.getValues()[0].map(function (h) { return String(h).trim(); });
+  var toDelete = [];
+  for (var c0 = 0; c0 < hdrs0.length; c0++) {
+    var field = fieldFor_(name2, hdrs0[c0]);
+    if (!hdrs0[c0]) continue;
+    var known = schema[field] || ALL_FIELDS.indexOf(field) !== -1;
+    if (known && !schema[field]) {
+      // a known pipeline column that doesn't belong on this tab: drop if empty
+      var lastR = sh.getLastRow();
+      var vals = lastR > HEADER_ROW
+        ? sh.getRange(HEADER_ROW + 1, c0 + 1, lastR - HEADER_ROW, 1).getValues()
+        : [];
+      var hasData = vals.some(function (v) { return v[0] !== '' && v[0] !== null; });
+      if (!hasData) toDelete.push(c0 + 1);
+      continue;
+    }
+    if (schema[field] && hdrs0[c0] !== labelFor_(name2, field)) {
+      sh.getRange(HEADER_ROW, c0 + 1).setValue(labelFor_(name2, field));
+    }
+  }
+  for (var d = toDelete.length - 1; d >= 0; d--) sh.deleteColumn(toDelete[d]);
+  // 2) every schema column in schema order (hunt data left, Terapeak right);
+  //    unknown user columns keep their relative order after them (v72)
+  orderToSchema_(sh, headersFor_(name2));
+}
+
+/**
+ * Move columns so they follow `schema` left to right. Earlier slots are
+ * settled first, so the wanted column is always to the right of its slot
+ * and moves left onto it — one moveColumns per out-of-place column.
+ */
+function orderToSchema_(sh, schema) {
+  var name = sh.getName();
+  sh.getRange(1, 1, 1, sh.getMaxColumns()).breakApart(); // banner merge blocks moves
+  for (var i = 0; i < schema.length; i++) {
+    var hdrs = sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn()).getValues()[0];
+    var col = 0;
+    for (var c = 0; c < hdrs.length; c++) {
+      if (fieldFor_(name, String(hdrs[c]).trim()) === schema[i]) { col = c + 1; break; }
+    }
+    if (!col || col === i + 1) continue;
+    try { sh.moveColumns(sh.getRange(1, col, sh.getMaxRows(), 1), i + 1); }
+    catch (mvErr) { /* bounds edge — skip this column, keep going */ }
+  }
+}
+
+/** merge a retiring column's values into its successor (blanks only), then drop it */
+function foldColumn_(sh, fromField, intoField) {
+  var map = headerMap_(sh);
+  var from = map[fromField];
+  if (!from) return;
+  var into = map[intoField];
+  var last = sh.getLastRow();
+  if (into && last > HEADER_ROW) {
+    var a = sh.getRange(HEADER_ROW + 1, into, last - HEADER_ROW, 1).getValues();
+    var b = sh.getRange(HEADER_ROW + 1, from, last - HEADER_ROW, 1).getValues();
+    var changed = false;
+    for (var r = 0; r < a.length; r++) {
+      if (String(a[r][0]).trim() === '' && String(b[r][0]).trim() !== '') { a[r][0] = b[r][0]; changed = true; }
+    }
+    if (changed) sh.getRange(HEADER_ROW + 1, into, a.length, 1).setValues(safeRows_(a));
+  }
+  sh.getRange(1, 1, 1, sh.getMaxColumns()).breakApart();
+  sh.deleteColumn(from);
+}
+
+/** v72: retire columns that told the same story twice or nothing at all */
+function retireColumns_(sh) {
+  foldColumn_(sh, 'niche_revenue_gbp', 'total_sales_gbp'); // same number, Terapeak's tile wins
+  var map = headerMap_(sh);
+  if (map.successful_pct) { // no longer measurable — always "-"
+    sh.getRange(1, 1, 1, sh.getMaxColumns()).breakApart();
+    sh.deleteColumn(map.successful_pct);
+  }
+}
+
+/**
+ * v75 self-heal for the hunting tabs:
+ *  1) a row that carries a Terapeak verdict (Reject reason filled) but whose
+ *     status slid back to "idea" (a re-hunt overwrote it) is restored to
+ *     "rejected" and painted red again;
+ *  2) an "idea" row whose keyword matches a rejected niche is a twin from a
+ *     re-hunt — it inherits the rejection (reason "duplicate of rejected
+ *     niche") so the validator never spends Terapeak searches on it twice.
+ */
+function healJudged_(sh) {
+  if (isListingLike_(sh.getName())) return;
+  var map = headerMap_(sh);
+  if (!map.status || !map.main_keyword) return;
+  var last = sh.getLastRow();
+  if (last <= HEADER_ROW) return;
+  var n = last - HEADER_ROW;
+  var stRng = sh.getRange(HEADER_ROW + 1, map.status, n, 1);
+  var statuses = stRng.getValues();
+  var reasons = map.failure_mode ? sh.getRange(HEADER_ROW + 1, map.failure_mode, n, 1).getValues() : null;
+  var kws = sh.getRange(HEADER_ROW + 1, map.main_keyword, n, 1).getValues();
+  var models = map.model ? sh.getRange(HEADER_ROW + 1, map.model, n, 1).getValues() : null;
+  var changed = false;
+  var repaint = [];
+  // pass 1: verdict present, status lost
+  for (var r = 0; r < n; r++) {
+    var st = String(statuses[r][0]).trim();
+    var reason = reasons ? String(reasons[r][0]).trim() : '';
+    if ((st === 'idea' || st === '') && reason) {
+      statuses[r][0] = 'rejected';
+      repaint.push(r);
+      changed = true;
+    }
+  }
+  // pass 2: twins of a rejected niche
+  var rejectedKw = {};
+  for (var r2 = 0; r2 < n; r2++) {
+    if (String(statuses[r2][0]).trim() !== 'rejected') continue;
+    if (reasons && String(reasons[r2][0]).trim() === 'tp-no-data') continue; // not a real verdict
+    var k = normKw_(kws[r2][0]);
+    if (k && !rejectedKw[k]) rejectedKw[k] = r2;
+  }
+  var reasonWrites = [];
+  var modelWrites = [];
+  for (var r3 = 0; r3 < n; r3++) {
+    if (String(statuses[r3][0]).trim() !== 'idea') continue;
+    var k3 = normKw_(kws[r3][0]);
+    if (!k3 || rejectedKw[k3] === undefined) continue;
+    statuses[r3][0] = 'rejected';
+    reasonWrites.push({ r: r3, v: 'duplicate of rejected niche' });
+    if (models) modelWrites.push({ r: r3, v: models[rejectedKw[k3]][0] });
+    repaint.push(r3);
+    changed = true;
+  }
+  if (!changed) return;
+  stRng.setValues(statuses);
+  reasonWrites.forEach(function (w) { if (map.failure_mode) sh.getRange(HEADER_ROW + 1 + w.r, map.failure_mode).setValue(w.v); });
+  modelWrites.forEach(function (w) { if (w.v) sh.getRange(HEADER_ROW + 1 + w.r, map.model).setValue(w.v); });
+  repaint.forEach(function (r4) { paintRow_(sh, HEADER_ROW + 1 + r4, COLOR_REJECTED); });
+}
+
+/**
+ * v74 migration: every rejected hunting row judged before v70 gets an
+ * explicit "dropship ✗" so the ideas endpoint never re-offers it to the
+ * DropShip button (a blank cell only counts as dropship until another
+ * model writes to it).
+ */
+function seedModels_(sh) {
+  if (isListingLike_(sh.getName())) return;
+  var map = headerMap_(sh);
+  if (!map.model || !map.status) return;
+  var last = sh.getLastRow();
+  if (last <= HEADER_ROW) return;
+  var n = last - HEADER_ROW;
+  var statuses = sh.getRange(HEADER_ROW + 1, map.status, n, 1).getValues();
+  var reasons = map.failure_mode ? sh.getRange(HEADER_ROW + 1, map.failure_mode, n, 1).getValues() : null;
+  var rng = sh.getRange(HEADER_ROW + 1, map.model, n, 1);
+  var models = rng.getValues();
+  var changed = false;
+  for (var r = 0; r < n; r++) {
+    if (String(statuses[r][0]).trim() === 'rejected' && String(models[r][0]).trim() === '' &&
+        !(reasons && String(reasons[r][0]).trim() === 'tp-no-data')) {
+      models[r][0] = 'dropship ✗';
+      changed = true;
+    }
+  }
+  if (changed) rng.setValues(models);
+}
+
+/** yyyy-mm-dd on date columns, so ISO timestamps never show (v72) */
+function dateFormat_(sh) {
+  var map = headerMap_(sh);
+  ['date', 'date_validated'].forEach(function (f) {
+    if (map[f] && sh.getMaxRows() > HEADER_ROW) {
+      sh.getRange(HEADER_ROW + 1, map[f], sh.getMaxRows() - HEADER_ROW, 1).setNumberFormat('yyyy-mm-dd');
+    }
+  });
+}
+
+/** every resolvable header shows its display label — no internal names (v72) */
+function relabelHeaders_(sh) {
+  var t = sh.getName();
+  var lastCol = sh.getLastColumn();
+  if (!lastCol) return;
+  var rng = sh.getRange(HEADER_ROW, 1, 1, lastCol);
+  var hdrs = rng.getValues()[0];
+  var changed = false;
+  for (var i = 0; i < hdrs.length; i++) {
+    var h = String(hdrs[i]).trim();
+    if (!h) continue;
+    var label = labelFor_(t, fieldFor_(t, h));
+    if (label !== h) { hdrs[i] = label; changed = true; }
+  }
+  if (changed) rng.setValues([hdrs]);
+  rng.setFontWeight('bold');
+}
+
+
+
+/**
+ * Percent columns store percent POINTS (17.14 means 17.14%). Historic cells
+ * hold fractions (Sheets parsed a "45%" string to 0.45, then a row move kept
+ * the 0.45 but dropped the percent format) — scale those up once, then give
+ * the whole column a literal-% display format.
+ */
+var PCT_POINT_COLS = ['str_30d_pct', 'str_90d_pct'];
+function fixPctColumns_(sh) {
+  var map = headerMap_(sh);
+  PCT_POINT_COLS.forEach(function (f) {
+    var col = map[f];
+    if (!col || sh.getMaxRows() <= HEADER_ROW) return;
+    sh.getRange(HEADER_ROW + 1, col, sh.getMaxRows() - HEADER_ROW, 1).setNumberFormat('0.0"%"');
+  });
+}
+
+
+
+/** Merge-and-delete any columns that resolve to the same field (v52). */
+function dedupeColumns_(sh) {
+  var t = sh.getName();
+  var lastCol = sh.getLastColumn();
+  if (!lastCol) return;
+  var hdrs = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+  var seen = {};
+  var dupes = [];
+  hdrs.forEach(function (h, i) {
+    var name = String(h).trim();
+    if (!name) return;
+    var f = fieldFor_(t, name);
+    if (seen[f]) dupes.push({ col: i + 1, firstCol: seen[f] });
+    else seen[f] = i + 1;
+  });
+  if (!dupes.length) return;
+  var last = sh.getLastRow();
+  dupes.forEach(function (d) {
+    if (last <= HEADER_ROW) return;
+    var a = sh.getRange(HEADER_ROW + 1, d.firstCol, last - HEADER_ROW, 1).getValues();
+    var b = sh.getRange(HEADER_ROW + 1, d.col, last - HEADER_ROW, 1).getValues();
+    var changed = false;
+    for (var r = 0; r < a.length; r++) {
+      if (String(a[r][0]).trim() === '' && String(b[r][0]).trim() !== '') {
+        a[r][0] = b[r][0];
+        changed = true;
+      }
+    }
+    if (changed) sh.getRange(HEADER_ROW + 1, d.firstCol, a.length, 1).setValues(safeRows_(a));
+  });
+  dupes.sort(function (x, y) { return y.col - x.col; });
+  dupes.forEach(function (d) { sh.deleteColumn(d.col); });
+}
+
+/** "8.9×" display on the Velocity column (v68). */
+function velocityFormat_(sh) {
+  var map = headerMap_(sh);
+  var col = map['velocity'];
+  if (!col || sh.getMaxRows() <= HEADER_ROW) return;
+  sh.getRange(HEADER_ROW + 1, col, sh.getMaxRows() - HEADER_ROW, 1)
+    .setNumberFormat('0.0"×"');
+}
+
+/** red->green gradient on the Score column so winners jump out (v56). */
+function scoreGradient_(sh) {
+  var map = headerMap_(sh);
+  var col = map['score'];
+  if (!col) return;
+  if (sh.getMaxRows() <= HEADER_ROW) return;
+  var range = sh.getRange(HEADER_ROW + 1, col, sh.getMaxRows() - HEADER_ROW, 1);
+  var rules = sh.getConditionalFormatRules().filter(function (r) {
+    var rs = r.getRanges();
+    return !(rs.length === 1 && rs[0].getColumn() === col && rs[0].getNumColumns() === 1);
+  });
+  rules.push(SpreadsheetApp.newConditionalFormatRule()
+    .setGradientMinpointWithValue('#f4cccc', SpreadsheetApp.InterpolationType.NUMBER, '0')
+    .setGradientMidpointWithValue('#fff2cc', SpreadsheetApp.InterpolationType.NUMBER, '50')
+    .setGradientMaxpointWithValue('#b7e1cd', SpreadsheetApp.InterpolationType.NUMBER, '100')
+    .setRanges([range])
+    .build());
+  sh.setConditionalFormatRules(rules);
+}
+
+/** slug from a title, mirroring the extension's makeSlug (v58). */
+function slugFromTitle_(title) {
+  return String(title).toLowerCase().replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(function (w) { return w && !/^\d/.test(w); })
+    .slice(0, 5).join('-');
+}
+
+/** keep slug as column 2 on the winners tab, where the schema puts it. */
+/**
+ * Put every winner column in LISTING_HEADERS order (v71). Columns appended by
+ * headerMap_ (e.g. Model / Total sales / Top 5 sold in v70) otherwise land
+ * after Listing status at the far right, outside their banner group. Unknown
+ * user columns keep their relative order after the schema columns.
+ */
+function orderWinnerCols_(sh) {
+  if (sh.getName() !== LISTING_TAB) return;
+  headerMap_(sh); // make sure every schema column exists first
+  orderToSchema_(sh, LISTING_HEADERS);
+}
+
+/**
+ * Simple trigger (v71): editing Listing status or Model by hand recolours the
+ * row at once — Yes -> sky blue, stock winner -> amber, otherwise the
+ * validated green — instead of waiting for the next formatSheets run.
+ */
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    var sh = e.range.getSheet();
+    if (sh.getName() !== LISTING_TAB) return;
+    var top = e.range.getRow();
+    if (top <= HEADER_ROW) return;
+    var hdrs = sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn()).getValues()[0];
+    var statusCol = 0, modelCol = 0;
+    for (var c = 0; c < hdrs.length; c++) {
+      var f = fieldFor_(LISTING_TAB, String(hdrs[c]).trim());
+      if (f === 'listing_status') statusCol = c + 1;
+      if (f === 'model') modelCol = c + 1;
+    }
+    var first = e.range.getColumn();
+    var last = first + e.range.getNumColumns() - 1;
+    var hit = (statusCol && statusCol >= first && statusCol <= last) ||
+      (modelCol && modelCol >= first && modelCol <= last);
+    if (!hit) return;
+    var n = e.range.getNumRows();
+    for (var r = 0; r < n; r++) {
+      var rowNum = top + r;
+      paintRow_(sh, rowNum, COLOR_VALIDATED);
+      if (modelCol) paintModel_(sh, rowNum, sh.getRange(rowNum, modelCol).getValue());
+      if (statusCol) paintListingStatus_(sh, rowNum, sh.getRange(rowNum, statusCol).getValue());
+    }
+  } catch (err) { /* cosmetic only — never break a hand edit */ }
+}
+
+/**
+ * Fill a BLANK winner slug from the title. Slugs are minted by the extension
+ * (a different algorithm) and are the key every write-back uses, so an
+ * existing slug is never rewritten — v64-v77 rewrote them all and every
+ * supplier write-back then missed its row and appended a twin.
+ */
+function fixMissingSlugs_(sh) {
+  if (sh.getName() !== LISTING_TAB) return;
+  var map = headerMap_(sh);
+  if (!map.slug || !map.title) return;
+  var last = sh.getLastRow();
+  if (last <= HEADER_ROW) return;
+  var n = last - HEADER_ROW;
+  var slugRng = sh.getRange(HEADER_ROW + 1, map.slug, n, 1);
+  var slugs = slugRng.getValues();
+  var titles = sh.getRange(HEADER_ROW + 1, map.title, n, 1).getValues();
+  var changed = false;
+  for (var r = 0; r < n; r++) {
+    var title = String(titles[r][0]).trim();
+    if (!title) continue;
+    if (String(slugs[r][0]).trim() === '') {
+      slugs[r][0] = slugFromTitle_(title);
+      changed = true;
+    }
+  }
+  if (changed) slugRng.setValues(slugs);
+}
+
+/** drop orphan hunting rows (slug but no title/url) left by unmatched writes. */
+function cleanupOrphanRows_(sh) {
+  if (isListingLike_(sh.getName())) return;
+  var map = headerMap_(sh);
+  if (!map.slug || !map.title) return;
+  var last = sh.getLastRow();
+  if (last <= HEADER_ROW) return;
+  var n = last - HEADER_ROW;
+  var slugs = sh.getRange(HEADER_ROW + 1, map.slug, n, 1).getValues();
+  var titles = sh.getRange(HEADER_ROW + 1, map.title, n, 1).getValues();
+  var urls = map.url ? sh.getRange(HEADER_ROW + 1, map.url, n, 1).getValues() : null;
+  var dead = [];
+  for (var r = 0; r < n; r++) {
+    if (!String(slugs[r][0]).trim()) continue;
+    var title = String(titles[r][0]).trim();
+    var url = urls ? String(urls[r][0]).trim() : '';
+    if (!title && !url) dead.push(HEADER_ROW + 1 + r);
+  }
+  dead.sort(function (a, b) { return b - a; }).forEach(function (rn) { sh.deleteRow(rn); });
+}
+
+/** reinstall the economics formulas on every Hunted Verified row (v57). */
+function fixEconRows_(sh) {
+  if (sh.getName() !== LISTING_TAB) return;
+  var map = headerMap_(sh);
+  if (!map.slug || !map.ebay_price_gbp) return;
+  var last = sh.getLastRow();
+  if (last <= HEADER_ROW) return;
+  var n = last - HEADER_ROW;
+  var slugs = sh.getRange(HEADER_ROW + 1, map.slug, n, 1).getValues();
+  // one setFormulas per column instead of four setFormula calls per row (v78)
+  var cols = ['ebay_fee_gbp', 'ad_cost_gbp', 'profit_gbp', 'margin_pct'].filter(function (f) { return map[f]; });
+  var perCol = {};
+  cols.forEach(function (f) { perCol[f] = sh.getRange(HEADER_ROW + 1, map[f], n, 1).getFormulas(); });
+  for (var r = 0; r < n; r++) {
+    if (!String(slugs[r][0]).trim()) continue;
+    var fx = econFormulas_(map, HEADER_ROW + 1 + r);
+    cols.forEach(function (f) { if (fx[f]) perCol[f][r][0] = fx[f]; });
+  }
+  cols.forEach(function (f) { sh.getRange(HEADER_ROW + 1, map[f], n, 1).setFormulas(perCol[f]); });
+  if (map.margin_pct) sh.getRange(HEADER_ROW + 1, map.margin_pct, n, 1).setNumberFormat('0.0"%"');
+  MONEY_COLS.forEach(function (f) { if (map[f]) sh.getRange(HEADER_ROW + 1, map[f], n, 1).setNumberFormat('£#,##0.00'); });
+}
+
+
+/**
+ * Collapse duplicate winner rows sharing one keyword (v61): keep the higher
+ * Score (newer wins a tie), back-fill its blanks from the loser, delete the
+ * loser. Runs inside formatSheets.
+ */
+function dedupeWinners_(sh) {
+  if (sh.getName() !== LISTING_TAB) return;
+  var map = headerMap_(sh);
+  if (!map.main_keyword) return;
+  var last = sh.getLastRow();
+  if (last <= HEADER_ROW) return;
+  var n = last - HEADER_ROW;
+  var kws = sh.getRange(HEADER_ROW + 1, map.main_keyword, n, 1).getValues();
+  var scores = map.score ? sh.getRange(HEADER_ROW + 1, map.score, n, 1).getValues() : null;
+  var seen = {}; // normKw -> {rowNum, score}
+  var losers = []; // {loser rowNum, keeper rowNum}
+  for (var r = 0; r < n; r++) {
+    var k = normKw_(kws[r][0]);
+    if (!k) continue;
+    var rowNum = HEADER_ROW + 1 + r;
+    var sc = scores ? Number(scores[r][0]) || 0 : 0;
+    if (!seen[k]) { seen[k] = { rowNum: rowNum, score: sc }; continue; }
+    if (sc >= seen[k].score) {
+      losers.push({ loser: seen[k].rowNum, keeper: rowNum });
+      seen[k] = { rowNum: rowNum, score: sc };
+    } else {
+      losers.push({ loser: rowNum, keeper: seen[k].rowNum });
+    }
+  }
+  // fill keeper blanks from its loser, then delete losers bottom-up
+  losers.forEach(function (pair) {
+    var lc = sh.getLastColumn();
+    var keepVals = sh.getRange(pair.keeper, 1, 1, lc).getValues()[0];
+    var loseVals = sh.getRange(pair.loser, 1, 1, lc).getValues()[0];
+    var changed = false;
+    for (var c2 = 0; c2 < lc; c2++) {
+      if (String(keepVals[c2]).trim() === '' && String(loseVals[c2]).trim() !== '') {
+        keepVals[c2] = loseVals[c2];
+        changed = true;
+      }
+    }
+    if (changed) sh.getRange(pair.keeper, 1, 1, lc).setValues(safeRows_([keepVals]));
+  });
+  losers.map(function (pr) { return pr.loser; })
+    .sort(function (a, b) { return b - a; })
+    .forEach(function (rn) { sh.deleteRow(rn); });
+}
+
+/** wipe stray manual backgrounds/fonts off the winners tab, repaint green. */
+/**
+ * Sort Hunted Verified best-first (v89). Tier 0 = passed dropship AND stock,
+ * 1 = stock only, 2 = dropship only, 3 = anything else; higher Score wins
+ * inside a tier. Uses a scratch column + Range.sort so formulas, colours and
+ * dropdowns travel with their rows; the scratch column is removed after.
+ * Returns the number of winner rows (tier < 3).
+ */
+function rankWinners_(sh) {
+  var last = sh.getLastRow();
+  var lastCol = sh.getLastColumn();
+  if (last <= HEADER_ROW || !lastCol) return 0;
+  var n = last - HEADER_ROW;
+  var map = headerMap_(sh);
+  var data = sh.getRange(HEADER_ROW + 1, 1, n, lastCol).getValues();
+  var winners = 0;
+  var keys = data.map(function (row) {
+    var slug = map.slug ? String(row[map.slug - 1] || '').trim() : 'x';
+    if (!slug) return [9e9];
+    var m = map.model ? row[map.model - 1] : '';
+    var ds = modelPassed_(m, 'dropship');
+    var st = modelPassed_(m, 'stock');
+    var tier = ds && st ? 0 : st ? 1 : ds ? 2 : 3;
+    if (tier < 3) winners++;
+    var sc = map.score ? Number(row[map.score - 1]) || 0 : 0;
+    return [tier * 1e7 + Math.max(0, 1e7 - 1 - Math.round(sc * 100))];
+  });
+  if (n < 2) return winners;
+  var col = lastCol + 1;
+  var inserted = false;
+  if (sh.getMaxColumns() < col) { sh.insertColumnsAfter(sh.getMaxColumns(), 1); inserted = true; }
+  sh.getRange(HEADER_ROW + 1, col, n, 1).setValues(keys);
+  sh.getRange(HEADER_ROW + 1, 1, n, col).sort([{ column: col, ascending: true }]);
+  if (inserted) sh.deleteColumn(col); else sh.getRange(HEADER_ROW + 1, col, n, 1).clearContent();
+  cleanWinnerStyles_(sh);
+  SpreadsheetApp.flush();
+  logWrite_('rank', '-', LISTING_TAB, '', 'sorted best-first: ' + winners + ' winners of ' + n + ' rows');
+  logFlush_();
+  return winners;
+}
+
+/** Run ▶ rankWinners — same sort from the editor. */
+function rankWinners() { return rankWinners_(getTab_(LISTING_TAB)); }
+
+function cleanWinnerStyles_(sh) {
+  if (sh.getName() !== LISTING_TAB) return;
+  var last = sh.getLastRow();
+  var lastCol = sh.getLastColumn();
+  if (last <= HEADER_ROW || !lastCol) return;
+  var n = last - HEADER_ROW;
+  var rng = sh.getRange(HEADER_ROW + 1, 1, n, lastCol);
+  var map = headerMap_(sh);
+  var models = map.model ? sh.getRange(HEADER_ROW + 1, map.model, n, 1).getValues() : null;
+  var statuses = map.listing_status ? sh.getRange(HEADER_ROW + 1, map.listing_status, n, 1).getValues() : null;
+  // one setBackgrounds for the whole tab: validated green, stock winners
+  // amber (v70), rows already listed keep their progress colour on top (v69)
+  var bgs = [];
+  for (var r = 0; r < n; r++) {
+    var color = COLOR_VALIDATED;
+    if (models && modelPassed_(models[r][0], 'stock')) color = MODEL_COLORS.stock;
+    var sc = statuses ? LISTING_STATUS_COLORS[String(statuses[r][0] || '').trim().toLowerCase()] : null;
+    if (sc) color = sc;
+    var row = [];
+    for (var c = 0; c < lastCol; c++) row.push(color);
+    bgs.push(row);
+  }
+  rng.setBackgrounds(bgs).setFontColor(null).setFontWeight('normal');
+}
+
+/** centre-align headers + data on every managed tab (v67). */
+function centerAll_(sh) {
+  var last = Math.max(sh.getLastRow(), HEADER_ROW);
+  var lastCol = sh.getLastColumn();
+  if (!lastCol) return;
+  sh.getRange(HEADER_ROW, 1, last - HEADER_ROW + 1, lastCol)
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+}
+
+/** fit-to-content column widths, clamped so the sheet stays scannable. */
+function tidyWidths_(sh) {
+  try {
+    var last = sh.getLastColumn();
+    if (!last) return;
+    sh.autoResizeColumns(1, last);
+    for (var c = 1; c <= last; c++) {
+      var w = sh.getColumnWidth(c);
+      if (w > 300) sh.setColumnWidth(c, 300);
+      else if (w < 60) sh.setColumnWidth(c, 70);
+    }
+  } catch (err) { /* cosmetic only */ }
+}
+
+/** Run manually: puts hunt data left / Terapeak right and redraws banners. */
+function formatSheets() {
+  // v77: hold the same lock as doPost. A verdict arriving while columns are
+  // being moved/deleted used a stale header map and landed cells in the
+  // wrong place (two winners lost their STR / sellers / removals evidence).
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(120000); } catch (err) { throw new Error('pipeline busy — try again in a minute'); }
+  try {
+    formatSheetsLocked_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+/** strip every dropdown rule off the data rows; the two real ones are re-applied right after (v84) */
+function clearStaleValidations_(sh) {
+  if (sh.getMaxRows() <= HEADER_ROW) return;
+  sh.getRange(HEADER_ROW + 1, 1, sh.getMaxRows() - HEADER_ROW, sh.getMaxColumns()).clearDataValidations();
+}
+
+function formatSheetsLocked_() {
+  settingsSheet_(); // Settings tab, fee knobs and named ranges (v78)
+  ALL_TABS.forEach(function (t) {
+    var sh = getTab_(t);
+    dedupeColumns_(sh);
+    fixPctColumns_(sh);
+    scoreGradient_(sh);
+    velocityFormat_(sh);
+    fixMissingSlugs_(sh);
+    cleanupOrphanRows_(sh);
+    dedupeWinners_(sh);
+    retireColumns_(sh);
+    healJudged_(sh);
+    seedModels_(sh);
+    cleanWinnerStyles_(sh);
+    fixEconRows_(sh);
+    if (isListingLike_(t)) {
+      orderWinnerCols_(sh);
+      pruneObsolete_(sh);
+    } else {
+      organizeColumns_(sh);
+    }
+    // v84: dropdowns go on AFTER the columns are ordered. Applying them first
+    // left the "No / Yes" rule on whatever column later took that position
+    // (Top 5 listings sold) — and a rule the value fails aborts the entire
+    // row write at the end of the run, after the script has already said ok.
+    clearStaleValidations_(sh);
+    listingStatusDropdown_(sh);
+    modelDropdown_(sh);
+    relabelHeaders_(sh);
+    dateFormat_(sh);
+    formatBanner_(sh);
+    centerAll_(sh);
+    tidyWidths_(sh);
+  });
+}
+
+/**
+ * The Listing tab is the AUTO LISTER work queue — its own schema with the
+ * economics pre-computed at promotion time.
+ */
+// Lean schema: ONLY what listing (and the Auto Lister) actually needs.
+// Validation evidence (str/sellers/removals/reviews/safety) stays behind in
+// the hunting tabs — everything here already passed those gates.
+// Story left to right: what it is -> what it earns -> how strong the signal
+// is -> the Terapeak evidence behind it -> where listing stands. Groups are
+// contiguous so the banner reads as five clean bands (v72).
+var LISTING_HEADERS = [
+  // 📦 PRODUCT
+  'date_validated', 'slug', 'main_keyword', 'title',
+  'source_url', 'supplier_url', 'lane',
+  // 💰 ECONOMICS
+  'supplier_cost_gbp', 'postage_cost_gbp', 'ebay_price_gbp', 'ebay_fee_gbp',
+  'ad_percent', 'ad_cost_gbp', 'profit_gbp', 'margin_pct',
+  // 🚀 SCORE & TREND
+  'score', 'trend', 'velocity',
+  // 📊 TERAPEAK EVIDENCE
+  'units_30d', 'units_90d', 'str_30d_pct', 'str_90d_pct', 'sellers_broad',
+  'total_sales_gbp', 'top5_sold', 'active_listings', 'listings_removed',
+  // 📝 LISTING — which business model won it, and where listing stands (v73)
+  'model', 'listing_status',
+];
+// fields that used to live on Hunted Verified but now belong to Ready to List
+// ('model' was the eBay item-specific there; since v70 it is the validation
+// model column and must NOT be pruned). niche_revenue_gbp / successful_pct
+// retired in v72 (see retireColumns_).
+var HUNTED_OBSOLETE = ['ebay_title', 'item_type', 'colour', 'material', 'size',
+  'features', 'department', 'category', 'condition', 'brand',
+  'quantity', 'date_ready', 'price', 'listed_item_id',
+  'niche_revenue_gbp', 'successful_pct'];
+
+
+/** Delete Ready-to-List columns left behind on the Hunted Verified sheet. */
+function pruneObsolete_(sh) {
+  var name = sh.getName();
+  sh.getRange(1, 1, 1, sh.getMaxColumns()).breakApart();
+  var hdrs = sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn()).getValues()[0];
+  for (var c = hdrs.length - 1; c >= 0; c--) {
+    var f = fieldFor_(name, String(hdrs[c]).trim());
+    if (HUNTED_OBSOLETE.indexOf(f) !== -1) sh.deleteColumn(c + 1);
+  }
+}
+// the Terapeak-evidence block on the Listing tab
+
+/** "£5.76" / " 5.76 " / 5.76 -> 5.76 (0 when unparseable) */
+function numeric_(v) {
+  var n = Number(String(v == null ? '' : v).replace(/[^0-9.\-]/g, ''));
+  return isFinite(n) ? n : 0;
+}
+
+function colA1_(n) {
+  var s2 = '';
+  while (n > 0) { var r = (n - 1) % 26; s2 = String.fromCharCode(65 + r) + s2; n = Math.floor((n - 1) / 26); }
+  return s2;
+}
+
+/** numeric-tolerant cell ref ("£5.76" text still computes) */
+function numRef_(col, rowNum) {
+  return 'VALUE(REGEXREPLACE(TO_TEXT(' + colA1_(col) + rowNum + '),"[^0-9.\\-]",""))';
+}
+
+/**
+ * LIVE economics: fee, ad cost, profit and margin become row formulas wired
+ * to price/cost/postage/ad% — edit any input cell and everything recomputes
+ * instantly. Fee model = the verified 2026 calculator.
+ */
+/**
+ * The formulas reference NAMED RANGES on the Settings tab (HTL_FVF_PCT, ...),
+ * so changing a fee rate there recomputes every winner row live — no
+ * re-run needed. Fee base = the sale price only: postage_cost_gbp is what
+ * the SELLER pays, so it belongs in the profit line, not in the fee base.
+ * Private sellers pay no selling fees (buyer protection fee instead).
+ */
+function econFormulas_(map, rowNum) {
+  var P = numRef_(map.ebay_price_gbp, rowNum);
+  var C = map.supplier_cost_gbp ? numRef_(map.supplier_cost_gbp, rowNum) : '0';
+  var PO = map.postage_cost_gbp ? numRef_(map.postage_cost_gbp, rowNum) : '0';
+  var AD = map.ad_percent ? numRef_(map.ad_percent, rowNum) : '0';
+  var vat = '(1+HTL_FEE_VAT_PCT/100)';
+  var biz = 'IF(LOWER(HTL_SELLER_TYPE)="private",0,1)';
+  var out = {};
+  out.ebay_fee_gbp =
+    '=IFERROR(ROUND((MIN(' + P + '*HTL_FVF_PCT/100,' + EBAY_FVF_CAP + ')+' + P + '*HTL_REG_FEE_PCT/100' +
+    '+IF(' + P + '>10,HTL_ORDER_FEE_HIGH,HTL_ORDER_FEE_LOW)+HTL_INSERTION_FEE)*' + vat + '*' + biz + ',2),"")';
+  out.ad_cost_gbp = '=IFERROR(ROUND(' + P + '*' + AD + '/100*' + vat + ',2),"")';
+  if (map.ebay_fee_gbp && map.ad_cost_gbp) {
+    out.profit_gbp = '=IFERROR(ROUND(' + P + '-' + colA1_(map.ebay_fee_gbp) + rowNum + '-' +
+      colA1_(map.ad_cost_gbp) + rowNum + '-' + C + '-' + PO + ',2),"")';
+  }
+  if (map.profit_gbp) {
+    // ROI = profit / money you put in (cost + postage) — the dropshipper metric
+    out.margin_pct = '=IFERROR(ROUND(' + colA1_(map.profit_gbp) + rowNum + '/(' + C + '+' + PO + ')*100,1),"")';
+  }
+  return out;
+}
+var MONEY_COLS = ['ebay_price_gbp', 'ebay_fee_gbp', 'ad_cost_gbp', 'profit_gbp', 'supplier_cost_gbp', 'postage_cost_gbp'];
+function setEconFormulas_(sh, map, rowNum) {
+  if (!map.ebay_price_gbp) return;
+  var fx = econFormulas_(map, rowNum);
+  Object.keys(fx).forEach(function (f) { if (map[f]) sh.getRange(rowNum, map[f]).setFormula(fx[f]); });
+  if (map.margin_pct) sh.getRange(rowNum, map.margin_pct).setNumberFormat('0.0"%"');
+  MONEY_COLS.forEach(function (f) { if (map[f]) sh.getRange(rowNum, map[f]).setNumberFormat('£#,##0.00'); });
+}
+
+
+
+// ============ eBay UK BUSINESS fee model — verified Aug 2026 ============
+// Rates live on the Settings tab as named ranges (see SETTINGS_DEFAULTS), so a
+// customer in another category edits one cell and every row recomputes.
+// Sources: eBay Seller Centre fee pages, eBay Feb-2026 seller update
+// (per-order fee 40p over £10, Business & Industrial 12.5%), 0.35% regulatory
+// operating fee since Apr 2024, 20% VAT on every fee for business sellers.
+var EBAY_FVF_CAP = 250;         // max final value fee per item (only matters above ~£2,100)
+var DEFAULT_POSTAGE = 0;        // large-letter model: postage inside the price
+
+
+
+function suggestedAdPercent(sellers) {
+  // more competition -> more ad push
+  if (!sellers) return 2;
+  if (sellers >= 30) return 4;
+  if (sellers >= 15) return 3;
+  return 2;
+}
+
+function round2(n) { return Math.round(n * 100) / 100; }
+/** today in the script's timezone (Europe/London via appsscript.json) — UTC stamped yesterday on BST evenings */
+function todayIso_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Europe/London', 'yyyy-MM-dd');
+}
+function escapeHtml_(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, function (ch) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+  });
+}
+
+// verdict row colors: rejected -> soft red, validated -> soft green
+var COLOR_REJECTED = '#f8d7da';
+var COLOR_VALIDATED = '#d4edda';
+// row-by-row story colors: fresh hunted row wash + per-criterion cells
+var COLOR_HUNTED = '#eef7f0';
+var COLOR_CHECK_PASS = '#d9ead3';
+var COLOR_CHECK_FAIL = '#f4cccc';
+
+/** paint each judged criterion's own cell — green passed, red missed */
+function paintChecks_(sh, map, rowNum, checks) {
+  try {
+    Object.keys(checks).forEach(function (f) {
+      // the winners tab carries the avg sold price as ebay_price_gbp
+      var col = map[f] || (f === 'volume_price_gbp' ? map.ebay_price_gbp : 0);
+      if (!col) return;
+      sh.getRange(rowNum, col).setBackground(
+        checks[f] === 'fail' ? COLOR_CHECK_FAIL : COLOR_CHECK_PASS
+      );
+    });
+  } catch (err) { /* cosmetic only — never block the pipeline */ }
+}
+
+function paintRow_(sh, rowNum, color) {
+  try {
+    sh.getRange(rowNum, 1, 1, Math.max(sh.getLastColumn(), 1)).setBackground(color);
+  } catch (err) { /* cosmetic only — never block the pipeline */ }
+}
+
+// listing progress colours on the winners tab (v69): Yes (listed) -> sky
+// blue. "No" and anything else keeps the validated green.
+var LISTING_STATUS_COLORS = { yes: '#cfe2f3', listed: '#cfe2f3', drafted: '#e1d5f5' };
+
+/** paint a winner row by its listing_status; no-op for unknown/blank values */
+function paintListingStatus_(sh, rowNum, status) {
+  var color = LISTING_STATUS_COLORS[String(status || '').trim().toLowerCase()];
+  if (color) paintRow_(sh, rowNum, color);
+}
+
+// the dropdown choices on the Listing status column (v69)
+var LISTING_STATUS_OPTIONS = ['No', 'Yes'];
+
+/** No / Drafted / Listed dropdown on every data cell of the Listing status column */
+function listingStatusDropdown_(sh) {
+  if (sh.getName() !== LISTING_TAB) return;
+  var map = headerMap_(sh);
+  var col = map['listing_status'];
+  if (!col || sh.getMaxRows() <= HEADER_ROW) return;
+  var rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(LISTING_STATUS_OPTIONS, true)
+    .setAllowInvalid(false)
+    .build();
+  var rng = sh.getRange(HEADER_ROW + 1, col, sh.getMaxRows() - HEADER_ROW, 1);
+  rng.setDataValidation(rule);
+  // blank cells read as "No" so the column is never half-empty
+  var last = sh.getLastRow();
+  if (last > HEADER_ROW) {
+    var vals = sh.getRange(HEADER_ROW + 1, col, last - HEADER_ROW, 1).getValues();
+    var changed = false;
+    for (var r = 0; r < vals.length; r++) {
+      if (String(vals[r][0]).trim() === '') { vals[r][0] = 'No'; changed = true; }
+    }
+    if (changed) sh.getRange(HEADER_ROW + 1, col, vals.length, 1).setValues(vals);
+  }
+}
+// ---- validation model (v70) ----
+// The Model cell is a union of every rule set that judged the row:
+//   "dropship"            passed DropShip
+//   "dropship, stock"     passed both
+//   "dropship, stock ✗"   passed DropShip, failed Stock Model
+// so each mode judges a niche at most once, and a winner is never demoted
+// because it missed the OTHER model's bar. Blank = pre-v70 = dropship only.
+var MODEL_COLORS = { stock: '#fff2cc' }; // stock winners amber, dropship stays green
+var MODEL_OPTIONS = ['dropship', 'stock', 'dropship, stock', 'dropship, stock ✗', 'dropship ✗, stock'];
+
+function normMode_(m) {
+  return String(m || '').trim().toLowerCase() === 'stock' ? 'stock' : 'dropship';
+}
+/** "dropship, stock ✗" -> [{mode:'dropship', pass:true}, {mode:'stock', pass:false}] */
+function modelTokens_(v) {
+  var out = [];
+  String(v || '').toLowerCase().split(/[,|\/]+/).forEach(function (t) {
+    t = t.trim();
+    if (!t) return;
+    var fail = t.indexOf('✗') !== -1;
+    var mode = t.replace(/✗/g, '').trim();
+    if (mode !== 'dropship' && mode !== 'stock') return;
+    out.push({ mode: mode, pass: !fail });
+  });
+  return out;
+}
+function modelString_(toks) {
+  return toks.map(function (t) { return t.mode + (t.pass ? '' : ' ✗'); }).join(', ');
+}
+function modelPassed_(v, mode) {
+  return modelTokens_(v).some(function (t) { return t.mode === mode && t.pass; });
+}
+/** has this mode judged the row at all (pass or fail)? blank counts as dropship */
+function modelJudged_(v, mode) {
+  var toks = modelTokens_(v);
+  if (!toks.length) return mode === 'dropship';
+  return toks.some(function (t) { return t.mode === mode; });
+}
+/** add one verdict to the union; a pass is never downgraded by a later miss */
+function addModel_(v, mode, pass) {
+  var toks = modelTokens_(v);
+  var hit = false;
+  toks.forEach(function (t) { if (t.mode === mode) { hit = true; t.pass = t.pass || pass; } });
+  if (!hit) toks.push({ mode: mode, pass: pass });
+  return modelString_(toks);
+}
+function mergeModels_(a, b) {
+  var r = String(a || '');
+  modelTokens_(b).forEach(function (t) { r = addModel_(r, t.mode, t.pass); });
+  return r;
+}
+function paintModel_(sh, rowNum, v) {
+  if (modelPassed_(v, 'stock')) paintRow_(sh, rowNum, MODEL_COLORS.stock);
+}
+/** dropdown on the winners' Model column; unions like "dropship, stock ✗" stay allowed */
+function modelDropdown_(sh) {
+  if (sh.getName() !== LISTING_TAB) return;
+  var map = headerMap_(sh);
+  var col = map['model'];
+  if (!col || sh.getMaxRows() <= HEADER_ROW) return;
+  var rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(MODEL_OPTIONS, true)
+    .setAllowInvalid(true)
+    .build();
+  sh.getRange(HEADER_ROW + 1, col, sh.getMaxRows() - HEADER_ROW, 1).setDataValidation(rule);
+  // pre-v70 winners all passed the DropShip rules
+  var last = sh.getLastRow();
+  if (last > HEADER_ROW) {
+    var vals = sh.getRange(HEADER_ROW + 1, col, last - HEADER_ROW, 1).getValues();
+    var changed = false;
+    for (var r = 0; r < vals.length; r++) {
+      if (String(vals[r][0]).trim() === '') { vals[r][0] = 'dropship'; changed = true; }
+    }
+    if (changed) sh.getRange(HEADER_ROW + 1, col, vals.length, 1).setValues(vals);
+  }
+}
+
+var SOURCE_TABS = {
+  'amazon': 'Amazon Hunting',
+  'aliexpress': 'AliExpress Hunting',
+  'ebay-search': 'eBay Hunting',
+  'ebay-competitor': 'eBay Hunting',
+  'terapeak': 'Amazon Hunting', // verdicts locate rows by slug anyway
+};
+var ALL_TABS = [LISTING_TAB, 'Amazon Hunting', 'AliExpress Hunting', 'eBay Hunting'];
+
+function headersFor_(name) {
+  if (name === LISTING_TAB) return LISTING_HEADERS;
+  return HUNT_LEFT.concat(SOURCE_EXTRA[name] || []).concat(HUNT_RIGHT).concat(TP_BLOCK);
+}
+
+function getTab_(name) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(name);
+  var expected = headersFor_(name);
+  var labels = expected.map(function (h) { return labelFor_(name, h); });
+  if (!sh) {
+    // explicit grid: the schemas are wider than a new sheet's 26 columns
+    sh = ss.insertSheet(name, { rows: 1000, columns: expected.length + 5 });
+  }
+  if (sh.getMaxColumns() < expected.length) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), expected.length - sh.getMaxColumns());
+  }
+  if (sh.getMaxRows() < HEADER_ROW + 1) sh.insertRowsAfter(sh.getMaxRows(), HEADER_ROW + 1 - sh.getMaxRows());
+  // a brand-new or half-created tab (no header row) gets its schema written
+  var hdrVals = sh.getRange(HEADER_ROW, 1, 1, Math.max(sh.getLastColumn(), expected.length)).getValues()[0];
+  var hasSlug = hdrVals.some(function (h) { return fieldFor_(name, h) === 'slug'; });
+  if (!hasSlug && hdrVals.every(function (h) { return String(h).trim() === ''; })) {
+    sh.getRange(HEADER_ROW, 1, 1, expected.length).setValues([labels]).setFontWeight('bold');
+    sh.setFrozenRows(HEADER_ROW);
+    formatBanner_(sh);
+  }
+  return sh;
+}
+
+// GET handlers must never mutate the sheet (a read arriving mid-formatSheets
+// used to append columns into a tab whose columns were being moved)
+var READ_ONLY_MAPS = false;
+function headerMap_(sh) {
+  var expected = headersFor_(sh.getName());
+  var name = sh.getName();
+  var lastCol = Math.max(sh.getLastColumn(), 1);
+  var row = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0].map(String);
+  var map = {};
+  row.forEach(function (h, i) { if (h.trim()) map[fieldFor_(name, h)] = i + 1; });
+  if (READ_ONLY_MAPS) return map;
+  expected.forEach(function (h) {
+    if (!map[h]) {
+      var col = sh.getLastColumn() + 1;
+      if (sh.getMaxColumns() < col) sh.insertColumnsAfter(sh.getMaxColumns(), col - sh.getMaxColumns());
+      sh.getRange(HEADER_ROW, col).setValue(labelFor_(name, h)).setFontWeight('bold');
+      map[h] = col;
+    }
+  });
+  return map;
+}
+
+function normUrl_(u) {
+  return String(u || '').split('?')[0].replace(/\/+$/, '').toLowerCase();
+}
+
+
+/**
+ * setValues parses a string starting with = + - @ as a FORMULA — a product
+ * title from a marketplace page could otherwise read this sheet's Settings
+ * tab. The leading apostrophe is Sheets' own text escape (v87).
+ */
+/** sheetSafe_ over a 2-D values array — for every getValues -> setValues round trip (v88) */
+function safeRows_(rows) {
+  return rows.map(function (r) { return r.map(sheetSafe_); });
+}
+function sheetSafe_(v) {
+  if (typeof v !== 'string') return v;
+  if (v === '-' || /^-?\d/.test(v) || v.charAt(0) === "'") return v;
+  return /^[=+\-@]/.test(v) ? "'" + v : v;
+}
+
+/** one read + one write per row (was one setValue per field); formula cells keep their formula */
+function writeFields_(sh, map, rowNum, c) {
+  var width = 0;
+  Object.keys(c).forEach(function (key) {
+    var col = map[key];
+    var val = c[key];
+    if (col && val !== undefined && val !== null && val !== '' && col > width) width = col;
+  });
+  if (!width) return;
+  if (sh.getMaxRows() < rowNum) sh.insertRowsAfter(sh.getMaxRows(), rowNum - sh.getMaxRows());
+  var rng = sh.getRange(rowNum, 1, 1, width);
+  var vals = rng.getValues()[0];
+  var fx = rng.getFormulas()[0];
+  // a cell stored as text reads back as a bare "=…" string; re-escape it or the
+  // round trip would turn it into a formula (v88)
+  var out = vals.map(function (v, i) { return fx[i] ? fx[i] : sheetSafe_(v); });
+  Object.keys(c).forEach(function (key) {
+    var col = map[key];
+    if (!col || col > width) return;
+    var val = c[key];
+    if (val === undefined || val === null || val === '') return;
+    out[col - 1] = sheetSafe_(val);
+  });
+  try {
+    rng.setValues([out]);
+    SpreadsheetApp.flush(); // surface a rejected write HERE, not silently after the reply
+  } catch (err) {
+    if (String(err).indexOf('data validation') === -1) throw err;
+    // v84: a dropdown rule left behind by an old column order rejects the value
+    // and Sheets drops the WHOLE row write. Only Model and Listing status may
+    // carry a rule — strip any other and write again.
+    var keep = [map.model, map.listing_status];
+    for (var i = 1; i <= width; i++) {
+      if (keep.indexOf(i) === -1) sh.getRange(rowNum, i).clearDataValidations();
+    }
+    rng.setValues([out]);
+    SpreadsheetApp.flush();
+  }
+}
+
+function readRow_(sh, map, rowNum) {
+  var obj = {};
+  var width = 0;
+  Object.keys(map).forEach(function (h) { if (map[h] > width) width = map[h]; });
+  if (!width) return obj;
+  var vals = sh.getRange(rowNum, 1, 1, width).getValues()[0];
+  Object.keys(map).forEach(function (h) {
+    var v = vals[map[h] - 1];
+    if (v !== '' && v !== null && v !== undefined) obj[h] = v;
+  });
+  return obj;
+}
+
+/** Map a hunting-tab row into the Listing schema and compute the economics. */
+function toListingRecord_(d) {
+  var cost = Number(d.supplier_cost_gbp) || 0;
+  var postage = DEFAULT_POSTAGE;
+  // starting sale price: the measured volume price, else 3.3x cost (30% ratio)
+  var price = Number(d.volume_price_gbp) || (cost > 0 ? round2(cost / 0.3) : '');
+  var adPct = suggestedAdPercent(Number(d.sellers_broad));
+  var isAli = String(d.source || '').indexOf('aliexpress') === 0;
+  return {
+    date_validated: todayIso_(),
+    slug: d.slug,
+    main_keyword: d.main_keyword,
+    model: d.model,
+    title: d.title,
+    source_url: d.url || d.source_url,
+    supplier_url: isAli ? d.url : '',   // Amazon/eBay ideas: fill after sourcing
+    lane: d.lane || (isAli ? 'CN' : ''),
+    supplier_cost_gbp: cost || '',
+    postage_cost_gbp: postage,
+    ebay_price_gbp: price,
+    ad_percent: adPct,
+    units_30d: d.units_30d,
+    units_90d: d.units_90d,
+    score: d.score,
+    trend: d.trend,
+    velocity: d.velocity,
+    // Terapeak's own Sales tile; the avg x sold estimate fills in when absent
+    total_sales_gbp: d.total_sales_gbp || d.niche_revenue_gbp,
+    top5_sold: d.top5_sold,
+    str_30d_pct: d.str_30d_pct,
+    str_90d_pct: d.str_90d_pct,
+    sellers_broad: d.sellers_broad,
+    active_listings: d.active_listings,
+    listings_removed: d.listings_removed,
+  };
+}
+
+function moveToListing_(loc) {
+  // never move a row backwards in the pipeline: Ready to List sits AFTER
+  // Hunted Verified, and the listed_item_id write-back arrives as "validated"
+  if (loc.sh.getName() === LISTING_TAB) return loc;
+  var data = readRow_(loc.sh, loc.map, loc.rowNum);
+  var dest = getTab_(LISTING_TAB);
+  var destMap = headerMap_(dest);
+  var newRow = dest.getLastRow() + 1;
+  var rec = toListingRecord_(data);
+  writeFields_(dest, destMap, newRow, rec);
+  setEconFormulas_(dest, destMap, newRow);
+  paintRow_(dest, newRow, COLOR_VALIDATED);
+  paintModel_(dest, newRow, rec.model);
+  loc.sh.deleteRow(loc.rowNum);
+  notifyWinner_(rec);
+  return { sh: dest, map: destMap, rowNum: newRow };
+}
+
+// ---- Settings tab (v76): the few knobs a customer may change by hand ----
+// MailApp always sends FROM the Google account that owns this script; the
+// Settings tab decides WHERE alerts go and whether they go at all. No
+// hard-coded address anywhere, so every copy of the sheet is self-contained.
+// ---- Log tab (v79): the last 300 writes, newest first — the support tool ----
+// One line per POSTed row: when, what kind of write, which slug, which fields
+// arrived, where it landed. Answers "why is this cell blank?" in one look.
+var LOG_TAB = 'Log';
+var LOG_MAX = 300;
+function logSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(LOG_TAB);
+  if (!sh) {
+    sh = ss.insertSheet(LOG_TAB);
+    sh.getRange(1, 1, 1, 6).setValues([['When', 'Kind', 'Slug', 'Landed', 'Fields received', 'Note']])
+      .setFontWeight('bold').setBackground('#d9d2e9');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 150); sh.setColumnWidth(3, 260); sh.setColumnWidth(4, 200); sh.setColumnWidth(5, 520); sh.setColumnWidth(6, 260);
+  }
+  return sh;
+}
+var LOG_BUFFER_ = [];
+function logWrite_(kind, slug, landed, fields, note) {
+  LOG_BUFFER_.push([new Date(), kind, sheetSafe_(String(slug || '')), String(landed || ''), sheetSafe_(String(fields || '')), sheetSafe_(String(note || ''))]);
+}
+function logFlush_() {
+  if (!LOG_BUFFER_.length) return;
+  try {
+    var sh = logSheet_();
+    sh.insertRowsAfter(1, LOG_BUFFER_.length);
+    sh.getRange(2, 1, LOG_BUFFER_.length, 6).setValues(LOG_BUFFER_.reverse());
+    sh.getRange(2, 1, LOG_BUFFER_.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+    var last = sh.getLastRow();
+    if (last > LOG_MAX + 1) sh.deleteRows(LOG_MAX + 2, last - LOG_MAX - 1);
+  } catch (err) { LOG_LAST_ERROR_ = String(err); /* logging must never block a write */ }
+  LOG_BUFFER_ = [];
+}
+var LOG_LAST_ERROR_ = '';
+/** the fields a POSTed row actually carried (non-blank), compact */
+function fieldList_(c) {
+  return Object.keys(c).filter(function (k) {
+    var v = c[k]; return v !== undefined && v !== null && v !== '' && k !== 'checks';
+  }).sort().join(' ');
+}
+
+var SETTINGS_TAB = 'Settings';
+var SETTINGS_DEFAULTS = [
+  ['alert_email', '', 'Where winner alerts are sent. Blank = the Google account that owns this script.'],
+  ['alerts', 'on', 'on / off — email when a product passes Terapeak'],
+  ['weekly_retro', 'on', 'on / off — Monday 8am summary email (needs Run ▶ setupTriggers once)'],
+  ['brand', 'HuntToList', 'Name shown in emails'],
+  ['api_token', '', 'Optional. When set, the extension must send the same token (Options ▸ Pipeline token).'],
+  // ---- eBay UK fee model (business seller, Aug 2026). Edit here; every winner row recomputes live.
+  ['fvf_pct', 11.9, 'Final value fee % for your main category (Home & Garden 11.9, most categories 12.9, Business & Industrial 12.5, Books/Media 9.9).'],
+  ['reg_fee_pct', 0.35, 'Regulatory operating fee % (0.35 since Apr 2024)'],
+  ['order_fee_low', 0.30, 'Fixed per-order fee £ for orders up to £10'],
+  ['order_fee_high', 0.40, 'Fixed per-order fee £ for orders over £10 (Feb 2026)'],
+  ['insertion_fee', 0, 'Insertion fee £ amortised per sale (0 with a Shop allowance or multi-quantity listings; 0.30 without)'],
+  ['fee_vat_pct', 20, 'VAT % added to every eBay fee (20 unless you reclaim it as a VAT-registered business — then 0)'],
+  ['seller_type', 'business', 'business / private — private sellers pay no selling fees (buyers pay a protection fee instead)'],
+];
+// Settings rows that feed the winner-row formulas, as named ranges
+var SETTINGS_RANGES = {
+  fvf_pct: 'HTL_FVF_PCT', reg_fee_pct: 'HTL_REG_FEE_PCT', order_fee_low: 'HTL_ORDER_FEE_LOW',
+  order_fee_high: 'HTL_ORDER_FEE_HIGH', insertion_fee: 'HTL_INSERTION_FEE',
+  fee_vat_pct: 'HTL_FEE_VAT_PCT', seller_type: 'HTL_SELLER_TYPE',
+};
+function settingsSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(SETTINGS_TAB);
+  var fresh = !sh;
+  if (fresh) {
+    sh = ss.insertSheet(SETTINGS_TAB);
+    sh.getRange(1, 1, 1, 3).setValues([['Setting', 'Value', 'What it does']])
+      .setFontWeight('bold').setBackground('#d9d2e9');
+    sh.setColumnWidth(1, 140);
+    sh.setColumnWidth(2, 260);
+    sh.setColumnWidth(3, 520);
+    sh.setFrozenRows(1);
+  }
+  // add any setting rows this version introduced (never overwrite a value),
+  // then (re)point the named ranges the economics formulas use
+  var last = sh.getLastRow();
+  var keys = last >= 2 ? sh.getRange(2, 1, last - 1, 1).getValues().map(function (r) { return String(r[0]).trim(); }) : [];
+  var rowOf = {};
+  keys.forEach(function (k, i) { if (k) rowOf[k] = i + 2; });
+  var missing = SETTINGS_DEFAULTS.filter(function (d) { return !rowOf[d[0]]; });
+  if (missing.length) {
+    sh.getRange(last + 1, 1, missing.length, 3).setValues(missing);
+    missing.forEach(function (d, i) { rowOf[d[0]] = last + 1 + i; });
+  }
+  if (fresh || missing.length) {
+    var existing = {};
+    ss.getNamedRanges().forEach(function (nr) { existing[nr.getName()] = nr; });
+    Object.keys(SETTINGS_RANGES).forEach(function (k) {
+      var name = SETTINGS_RANGES[k];
+      var rng = sh.getRange(rowOf[k], 2);
+      if (existing[name]) existing[name].setRange(rng); else ss.setNamedRange(name, rng);
+    });
+  }
+  return sh;
+}
+/** the API token a customer may set on the Settings tab ('' = open) */
+function authOk_(token) {
+  var want = settingGet_('api_token');
+  return !want || String(token || '') === want;
+}
+function settingGet_(key) {
+  try {
+    var sh = settingsSheet_();
+    var last = sh.getLastRow();
+    if (last < 2) return '';
+    var vals = sh.getRange(2, 1, last - 1, 2).getValues();
+    for (var i = 0; i < vals.length; i++) {
+      if (String(vals[i][0]).trim() === key) return String(vals[i][1]).trim();
+    }
+  } catch (err) { /* settings are optional */ }
+  return '';
+}
+function settingOn_(key) {
+  return settingGet_(key).toLowerCase() !== 'off';
+}
+/** alert recipient: Settings ▸ alert_email, else the script owner; '' = nobody */
+function ownerEmail_() {
+  var custom = settingGet_('alert_email');
+  if (custom && custom.indexOf('@') > 0) return custom;
+  return Session.getEffectiveUser().getEmail() || '';
+}
+function brandName_() { return settingGet_('brand') || 'HuntToList'; }
+
+/** 🏆 Instant alert when a product passes Terapeak and lands in Listing. */
+function notifyWinner_(rec) {
+  try {
+    if (!settingOn_('alerts')) return;
+    var to = ownerEmail_();
+    if (!to) return;
+    var url = SpreadsheetApp.getActiveSpreadsheet().getUrl();
+    var html =
+      '<div style="font-family:Arial,sans-serif;max-width:560px">' +
+      '<h2 style="color:#16a34a">🏆 ' + escapeHtml_(brandName_()) + ' — winner validated!</h2>' +
+      '<p style="font-size:15px"><b>' + escapeHtml_(rec.title) + '</b></p>' +
+      '<table style="font-size:13px;border-collapse:collapse">' +
+      trRow_('💷 Suggested eBay price', '£' + (rec.ebay_price_gbp || '?')) +
+      trRow_('🏆 Score / trend', (rec.score !== undefined ? rec.score : '?') + ' · ' + (rec.trend || '-')) +
+      trRow_('📈 Sold (30d) / STR', (rec.units_30d || '?') + ' · ' + (rec.str_30d_pct || rec.str_90d_pct || '?') + '%') +
+      trRow_('👥 Sellers', rec.sellers_broad !== undefined ? rec.sellers_broad : '?') +
+      trRow_('💰 Sales £ (30d)', '£' + (rec.total_sales_gbp || '?')) +
+      '</table>' +
+      '<p><a href="' + url + '" style="background:#16a34a;color:#fff;padding:10px 18px;' +
+      'border-radius:8px;text-decoration:none;font-weight:bold">Open Hunted Verified →</a></p>' +
+      '<p style="color:#94a3b8;font-size:11px">' + escapeHtml_(brandName_()) + '</p></div>';
+    MailApp.sendEmail({
+      to: to,
+      name: brandName_(),
+      subject: '🏆 Winner validated: ' + String(rec.title).slice(0, 70),
+      htmlBody: html,
+    });
+  } catch (err) { /* email quota or perms — never block the pipeline */ }
+}
+
+function trRow_(k, v) {
+  return '<tr><td style="padding:4px 14px 4px 0;color:#64748b">' + k +
+         '</td><td style="padding:4px 0"><b>' + v + '</b></td></tr>';
+}
+
+/** 📬 Weekly Monday retro — run by the time trigger from setupTriggers(). */
+function weeklyRetro() {
+  var since = new Date();
+  since.setDate(since.getDate() - 7);
+  var tabs = ['Amazon Hunting', 'AliExpress Hunting', 'eBay Hunting'];
+  var added = 0, rejected = 0, pending = 0;
+  var modes = {};
+  tabs.forEach(function (t) {
+    var sh = getTab_(t);
+    var map = headerMap_(sh);
+    var last = sh.getLastRow();
+    if (last <= HEADER_ROW) return;
+    var data = sh.getRange(HEADER_ROW + 1, 1, last - HEADER_ROW, sh.getLastColumn()).getValues();
+    data.forEach(function (row) {
+      var d = new Date(row[map['date'] - 1]);
+      var st = String(row[map['status'] - 1]);
+      if (!isNaN(d) && d >= since) added++;
+      if (st === 'idea') pending++;
+      if (st === 'rejected') {
+        rejected++;
+        var fm = String(row[map['failure_mode'] - 1] || 'unknown');
+        modes[fm] = (modes[fm] || 0) + 1;
+      }
+    });
+  });
+  var winners = Math.max(0, getTab_(LISTING_TAB).getLastRow() - HEADER_ROW);
+  var modeLines = Object.keys(modes).sort(function (a, b) { return modes[b] - modes[a]; })
+    .map(function (m) { return trRow_(escapeHtml_(m), modes[m]); }).join('');
+  var url = SpreadsheetApp.getActiveSpreadsheet().getUrl();
+  var html =
+    '<div style="font-family:Arial,sans-serif;max-width:560px">' +
+    '<h2 style="color:#2563eb">📬 ' + escapeHtml_(brandName_()) + ' — weekly retro</h2>' +
+    '<table style="font-size:13px;border-collapse:collapse">' +
+    trRow_('🆕 Ideas added (7 days)', added) +
+    trRow_('🏆 Winners in Hunted Verified (total)', winners) +
+    trRow_('❌ Rejected (total)', rejected) +
+    trRow_('⏳ Pending ideas', pending) +
+    '</table>' +
+    '<h3 style="color:#334155">Rejection reasons</h3>' +
+    '<table style="font-size:13px;border-collapse:collapse">' + (modeLines || trRow_('—', 'none yet')) + '</table>' +
+    '<p><a href="' + url + '" style="background:#2563eb;color:#fff;padding:10px 18px;' +
+    'border-radius:8px;text-decoration:none;font-weight:bold">Open the pipeline →</a></p>' +
+    '<p style="color:#94a3b8;font-size:11px">' + escapeHtml_(brandName_()) + '</p></div>';
+  if (!settingOn_('weekly_retro')) return;
+  var retroTo = ownerEmail_();
+  if (!retroTo) return;
+  MailApp.sendEmail({ to: retroTo, name: brandName_(), subject: '📬 ' + brandName_() + ' weekly retro', htmlBody: html });
+}
+
+/** ONE-TIME: Run > setupTriggers to install the Monday 8am retro email. */
+function setupTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'weeklyRetro') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('weeklyRetro')
+    .timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(8).create();
+}
+
+/** One slug/url -> row index across all tabs, built once per request. */
+/** "Shoe Washing Machine Bag" and "shoe washing machine bag " are one niche */
+function readCell_(loc, field) {
+  var col = loc.map[field];
+  return col ? loc.sh.getRange(loc.rowNum, col).getValue() : '';
+}
+
+/** true for '', null, undefined — NOT for 0 (removals = 0 is a real value) */
+function isBlank_(v) { return v === '' || v === null || v === undefined; }
+/** '-' is what the extension writes when a Terapeak page showed nothing — unknown, not evidence (v85) */
+function isUnknown_(v) { return isBlank_(v) || String(v).trim() === '-'; }
+
+function byDate_(a, b) { return String(a.date || '').localeCompare(String(b.date || '')); }
+
+function normKw_(kw) {
+  return String(kw || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function buildIndex_() {
+  // kw = winner niches; judged = hunting rows Terapeak already rejected (v75),
+  // so a re-hunt of a rejected niche is reported as existing, never re-queued
+  var idx = { slug: {}, url: {}, kw: {}, judged: {} };
+  ALL_TABS.forEach(function (t) {
+    var sh = getTab_(t);
+    var map = headerMap_(sh);
+    var isWinner = isListingLike_(t);
+    var last = sh.getLastRow();
+    if (last <= HEADER_ROW) return;
+    var n = last - HEADER_ROW;
+    var slugs = sh.getRange(HEADER_ROW + 1, map['slug'], n, 1).getValues();
+    var urls = map['url'] ? sh.getRange(HEADER_ROW + 1, map['url'], n, 1).getValues() : null;
+    // winner rows carry source_url/supplier_url instead of url, and their
+    // keyword is the niche identity — index all three
+    var srcs = isWinner && map['source_url'] ? sh.getRange(HEADER_ROW + 1, map['source_url'], n, 1).getValues() : null;
+    var sups = isWinner && map['supplier_url'] ? sh.getRange(HEADER_ROW + 1, map['supplier_url'], n, 1).getValues() : null;
+    var kws = map['main_keyword'] ? sh.getRange(HEADER_ROW + 1, map['main_keyword'], n, 1).getValues() : null;
+    var statuses = !isWinner && map['status'] ? sh.getRange(HEADER_ROW + 1, map['status'], n, 1).getValues() : null;
+    var reasons = !isWinner && map['failure_mode'] ? sh.getRange(HEADER_ROW + 1, map['failure_mode'], n, 1).getValues() : null;
+    for (var r = 0; r < n; r++) {
+      var loc = { sh: sh, map: map, rowNum: r + HEADER_ROW + 1 };
+      var sl = String(slugs[r][0]);
+      if (sl && !idx.slug[sl]) idx.slug[sl] = loc;
+      var cands = [urls && urls[r][0], srcs && srcs[r][0], sups && sups[r][0]];
+      for (var ui = 0; ui < cands.length; ui++) {
+        if (!cands[ui]) continue;
+        var u = normUrl_(cands[ui]);
+        if (u && !idx.url[u]) idx.url[u] = loc;
+      }
+      if (kws) {
+        var k = normKw_(kws[r][0]);
+        if (k && isWinner && !idx.kw[k]) idx.kw[k] = loc;
+        var judged = statuses && String(statuses[r][0]).trim() === 'rejected' &&
+          !(reasons && String(reasons[r][0]).trim() === 'tp-no-data');
+        if (k && judged && !idx.judged[k]) idx.judged[k] = loc;
+      }
+    }
+  });
+  return idx;
+}
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  try { lock.waitLock(25000); } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'busy — try again' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  try {
+    return doPostLocked_(e);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function doPostLocked_(e) {
+  var body;
+  try {
+    body = JSON.parse(e && e.postData && e.postData.contents || '');
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'bad JSON body' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  if (!authOk_(body.token)) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'unauthorised — check the pipeline token' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  // v87: reads arrive as POST {action, ...params, token} so the token is never
+  // part of a URL; the same handlers answer either way
+  if (body.action && !body.candidates && !body.verdict) {
+    READ_ONLY_MAPS = true;
+    try { return doGetLocked_({ parameter: body }); } finally { READ_ONLY_MAPS = false; }
+  }
+  var rows = body.candidates || (body.verdict ? [body.verdict] : []);
+  var received = 0;
+  var existing = 0;
+  var idx = buildIndex_();
+  // promotions are DEFERRED: moveToListing_ deletes the source row, which
+  // would shift every later rowNum in the index and corrupt the batch
+  var promotions = [];
+
+  rows.forEach(function (c) {
+    if (!c || !c.slug) return;
+    received++;
+    if (c.generic === true) c.generic = 'yes';
+    if (c.generic === false) c.generic = 'no';
+
+    var loc = idx.slug[String(c.slug)] || (c.url ? idx.url[normUrl_(c.url)] : null);
+    // a fresh hunt of a product already past hunting: report, don't touch it
+    // (hunt rows carry status 'idea', or generic/safety fields with no status).
+    // The winner check ALSO matches by keyword — the same product from a
+    // different supplier carries a new URL and slug, but the same niche.
+    var isHuntWrite = String(c.status) === 'idea' || (c.generic !== undefined && !c.status);
+    var kwN = c.main_keyword ? normKw_(c.main_keyword) : '';
+    var winnerHit = (loc && isListingLike_(loc.sh.getName())) ? loc : (kwN ? idx.kw[kwN] : null);
+    if (isHuntWrite && winnerHit) {
+      existing++;
+      logWrite_('hunt', c.slug, 'skipped: already a winner', fieldList_(c));
+      return;
+    }
+    // v75: a hunt write must never reopen a judged row. Before this, re-hunting
+    // a rejected product (same slug) overwrote status back to "idea" — the row
+    // stayed red but the validator queued it again — and a re-hunt under a
+    // slightly different title made a twin row the keyword guard never saw.
+    if (isHuntWrite) {
+      var judgedRow = loc && !isListingLike_(loc.sh.getName()) &&
+        String(readCell_(loc, 'status')).trim() === 'rejected';
+      if (judgedRow || (kwN && idx.judged[kwN])) {
+        existing++;
+        logWrite_('hunt', c.slug, 'skipped: niche already rejected', fieldList_(c));
+        return;
+      }
+    }
+    // v70: a verdict names the rule set that judged it; the Model cell keeps
+    // the union so the same niche is judged once per mode
+    var verdictStatus = String(c.status);
+    // v86: the extension judges BOTH rule sets per sweep and sends the Model
+    // union ("dropship ✗, stock"); `mode` is the button pressed (its reasons
+    // lead when both fail). Older builds send a single mode name in `model`.
+    var mode = c.mode ? normMode_(c.mode) : (c.model ? normMode_(c.model) : '');
+    var dual = modelTokens_(c.model).length > 1;
+    delete c.mode;
+    // a Terapeak page that showed nothing (glitch, slow load) is NOT a verdict
+    // on the niche — no model token, so the row is offered again next run
+    var noData = String(c.failure_mode || '') === 'tp-no-data';
+    if (noData) delete c.model;
+    if (noData && loc && isListingLike_(loc.sh.getName())) {
+      // v87: an empty Terapeak page says nothing about a winner — do not
+      // overwrite its evidence with placeholders or paint its cells
+      logWrite_('verdict:' + (mode || '?'), c.slug, loc.sh.getName() + ' row ' + loc.rowNum, fieldList_(c), 'tp-no-data — winner untouched');
+      return;
+    }
+    if (mode && !noData && (verdictStatus === 'validated' || verdictStatus === 'rejected')) {
+      var prior = loc ? String(readCell_(loc, 'model')).trim() : '';
+      if (loc && !prior) {
+        // pre-v70 rows were judged under the DropShip rules only — make that
+        // explicit BEFORE adding a new token, or the implicit verdict is lost
+        // and the DropShip button would re-offer every old red row (v74)
+        if (isListingLike_(loc.sh.getName())) prior = 'dropship';
+        else if (String(readCell_(loc, 'status')) === 'rejected') prior = 'dropship ✗';
+      }
+      c.model = dual ? mergeModels_(prior, c.model) : addModel_(prior, mode, verdictStatus === 'validated');
+      if (loc && isListingLike_(loc.sh.getName()) && verdictStatus === 'rejected') {
+        // an existing winner missing the OTHER model's bar stays a winner:
+        // record the miss and the evidence, keep the row's colour
+        writeFields_(loc.sh, loc.map, loc.rowNum, {
+          model: c.model, total_sales_gbp: c.total_sales_gbp, top5_sold: c.top5_sold,
+        });
+        logWrite_('verdict:' + mode, c.slug, loc.sh.getName() + ' row ' + loc.rowNum, fieldList_(c), 'rejected under the other model — winner kept');
+        return;
+      }
+    }
+    if (!loc) {
+      if (!c.date) c.date = todayIso_();
+      if (String(c.status) === 'validated') {
+        // straight-to-Listing insert: run the economics mapper too
+        var dest = getTab_(LISTING_TAB);
+        var destMap = headerMap_(dest);
+        var rec = toListingRecord_(c);
+        var newRow = dest.getLastRow() + 1;
+        writeFields_(dest, destMap, newRow, rec);
+        setEconFormulas_(dest, destMap, newRow);
+        paintRow_(dest, newRow, COLOR_VALIDATED);
+        paintModel_(dest, newRow, rec.model);
+        if (c.checks) paintChecks_(dest, destMap, newRow, c.checks);
+        idx.slug[String(c.slug)] = { sh: dest, map: destMap, rowNum: newRow };
+        if (c.url) idx.url[normUrl_(c.url)] = idx.slug[String(c.slug)];
+        logWrite_('verdict:' + (mode || '?'), c.slug, LISTING_TAB + ' row ' + newRow + ' (new)', fieldList_(c), 'straight to winners');
+        notifyWinner_(rec);
+        return;
+      }
+      var sh = getTab_(SOURCE_TABS[c.source] || 'Amazon Hunting');
+      var map = headerMap_(sh);
+      loc = { sh: sh, map: map, rowNum: sh.getLastRow() + 1 };
+      writeFields_(loc.sh, loc.map, loc.rowNum, c);
+      // fresh find that passed the hunt gates -> pale green wash
+      if (String(c.generic) === 'yes' && String(c.safety_verdict) === 'clear') {
+        paintRow_(loc.sh, loc.rowNum, COLOR_HUNTED);
+      }
+      idx.slug[String(c.slug)] = loc; // same-batch duplicates update, not append
+      if (c.url) idx.url[normUrl_(c.url)] = loc;
+      logWrite_('hunt', c.slug, loc.sh.getName() + ' row ' + loc.rowNum + ' (new)', fieldList_(c));
+    } else {
+      writeFields_(loc.sh, loc.map, loc.rowNum, c);
+      var missing = mode ? ['sellers_broad', 'str_30d_pct', 'active_listings', 'listings_removed', 'top5_sold']
+        .filter(function (f) { return isBlank_(c[f]); }) : [];
+      logWrite_(mode ? 'verdict:' + mode : (isHuntWrite ? 'hunt' : 'update'), c.slug,
+        loc.sh.getName() + ' row ' + loc.rowNum, fieldList_(c),
+        String(c.status || '') + (missing.length ? ' — payload missing: ' + missing.join(' ') : ''));
+      // lister progress: {slug, listing_status:'drafted'|'listed'} colours the winner row
+      if (c.listing_status && isListingLike_(loc.sh.getName())) {
+        paintListingStatus_(loc.sh, loc.rowNum, c.listing_status);
+      }
+    }
+    // verdict colors: rejected -> red row; validated -> promoted AFTER the batch
+    // v85: a winner row is never painted red here — a real miss under the other
+    // model returned above; what reaches this line for a winner is a no-data glitch
+    if (String(c.status) === 'rejected' && !isListingLike_(loc.sh.getName())) paintRow_(loc.sh, loc.rowNum, COLOR_REJECTED);
+    if (String(c.status) === 'validated') {
+      // the same row twice in one batch would delete a neighbour on the second pass
+      var dup = promotions.some(function (p) { return p.loc.sh.getName() === loc.sh.getName() && p.loc.rowNum === loc.rowNum; });
+      if (!dup) promotions.push({ loc: loc, checks: c.checks });
+    } else if (c.checks) {
+      paintChecks_(loc.sh, loc.map, loc.rowNum, c.checks);
+    }
+  });
+
+  // run promotions bottom-up per sheet so each deleteRow cannot shift a row
+  // another pending promotion still points at
+  promotions.sort(function (a, b) { return b.loc.rowNum - a.loc.rowNum; });
+  promotions.forEach(function (pm) {
+    // one niche = one winner row: if this keyword already has a winner, merge
+    // the fresh data into it and drop the source row — never append a twin
+    var kw = normKw_(readCell_(pm.loc, 'main_keyword'));
+    var win = kw ? idx.kw[kw] : null;
+    if (win && win.sh.getName() !== pm.loc.sh.getName()) {
+      var data = readRow_(pm.loc.sh, pm.loc.map, pm.loc.rowNum);
+      var rec = toListingRecord_(data);
+      // fresh Terapeak evidence overwrites; identity AND hand-priced economics
+      // only fill blanks — a re-judge must not reset a price the user set
+      ['slug', 'title', 'source_url', 'supplier_url', 'supplier_cost_gbp', 'lane',
+       'ebay_price_gbp', 'postage_cost_gbp', 'ad_percent', 'date_validated'].forEach(function (f) {
+        if (String(readCell_(win, f)).trim()) delete rec[f];
+      });
+      // the niche keeps every model it has passed under
+      rec.model = mergeModels_(readCell_(win, 'model'), data.model);
+      writeFields_(win.sh, win.map, win.rowNum, rec);
+      setEconFormulas_(win.sh, win.map, win.rowNum);
+      paintRow_(win.sh, win.rowNum, COLOR_VALIDATED);
+      paintModel_(win.sh, win.rowNum, rec.model);
+      paintListingStatus_(win.sh, win.rowNum, readCell_(win, 'listing_status'));
+      if (pm.checks) paintChecks_(win.sh, win.map, win.rowNum, pm.checks);
+      pm.loc.sh.deleteRow(pm.loc.rowNum);
+      return;
+    }
+    var dest = moveToListing_(pm.loc);
+    if (kw) idx.kw[kw] = dest; // a second same-niche promotion in this batch merges
+    if (dest.sh.getName() === pm.loc.sh.getName()) {
+      // an existing winner re-judged under the other model: repaint in place
+      paintRow_(dest.sh, dest.rowNum, COLOR_VALIDATED);
+      paintModel_(dest.sh, dest.rowNum, readCell_(dest, 'model'));
+      paintListingStatus_(dest.sh, dest.rowNum, readCell_(dest, 'listing_status'));
+    }
+    if (pm.checks) paintChecks_(dest.sh, dest.map, dest.rowNum, pm.checks);
+  });
+
+  logFlush_();
+  return ContentService.createTextOutput(
+    JSON.stringify({ ok: true, received: received, existing: existing })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
+
+function doGet(e) {
+  // reads must not interleave with formatSheets moving columns (v78); the
+  // extension retries a 'busy' reply
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'busy — try again' }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  READ_ONLY_MAPS = true;
+  try {
+    if (e && e.parameter && e.parameter.action && !authOk_(e.parameter.token)) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'unauthorised — check the pipeline token' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    return doGetLocked_(e);
+  } finally {
+    READ_ONLY_MAPS = false;
+    lock.releaseLock();
+  }
+}
+function doGetLocked_(e) {
+  // ?action=ideas&limit=N -> oldest pending ideas from the hunting tabs
+  // (generic yes + safety clear + status idea) for the Terapeak validator
+  // &mode=dropship|stock (v70): rows already REJECTED under the other model
+  // are offered again after the fresh ideas, and &source=winners offers
+  // Hunted Verified rows not yet judged under this mode (proven dropship
+  // niches are the best Stock Model candidates)
+  if (e && e.parameter && e.parameter.action === 'ideas') {
+    var limit = Math.min(Number(e.parameter.limit) || 10, 50);
+    var mode = e.parameter.mode ? normMode_(e.parameter.mode) : '';
+    var srcParam = String(e.parameter.source || '').toLowerCase();
+    var ideas = [];
+    var retries = [];
+    if (srcParam === 'winners') {
+      var wsh0 = getTab_(LISTING_TAB);
+      var wmap0 = headerMap_(wsh0);
+      var wlast0 = wsh0.getLastRow();
+      if (wlast0 > HEADER_ROW) {
+        var wdata0 = wsh0.getRange(HEADER_ROW + 1, 1, wlast0 - HEADER_ROW, wsh0.getLastColumn()).getValues();
+        for (var wr0 = 0; wr0 < wdata0.length; wr0++) {
+          var wrow0 = wdata0[wr0];
+          var wslug = String(wrow0[wmap0['slug'] - 1] || '').trim();
+          if (!wslug) continue;
+          // a winner with ANY evidence cell blank is offered again whatever its
+          // model, so one re-judge run refills the row (v77, widened v80)
+          // (top5_sold is excluded: rows judged before v70 never had it)
+          var incomplete = ['sellers_broad', 'str_30d_pct', 'active_listings', 'listings_removed']
+            .some(function (f) { return wmap0[f] && isUnknown_(wrow0[wmap0[f] - 1]); });
+          if (!incomplete && mode && modelJudged_(wmap0['model'] ? wrow0[wmap0['model'] - 1] : '', mode)) continue;
+          ideas.push({
+            slug: wslug,
+            title: String(wrow0[wmap0['title'] - 1] || ''),
+            source: 'winner',
+            main_keyword: wmap0['main_keyword'] ? String(wrow0[wmap0['main_keyword'] - 1] || '') : '',
+          });
+        }
+      }
+      return ContentService.createTextOutput(
+        JSON.stringify({ ok: true, ideas: ideas.slice(0, limit) })
+      ).setMimeType(ContentService.MimeType.JSON);
+    }
+    var SRC_TAB = { amazon: 'Amazon Hunting', aliexpress: 'AliExpress Hunting', ebay: 'eBay Hunting' };
+    var only = SRC_TAB[srcParam];
+    var tabs = only ? [only] : ['Amazon Hunting', 'AliExpress Hunting', 'eBay Hunting'];
+    // pass 1 (v75): every niche already judged under this mode, across ALL
+    // hunting tabs, so a fresh twin of a rejected niche is never offered
+    var judgedKw = {};
+    var tabData = {};
+    ['Amazon Hunting', 'AliExpress Hunting', 'eBay Hunting'].forEach(function (tab) {
+      var sh = getTab_(tab);
+      var map = headerMap_(sh);
+      var last = sh.getLastRow();
+      if (last <= HEADER_ROW) return;
+      var data = sh.getRange(HEADER_ROW + 1, 1, last - HEADER_ROW, sh.getLastColumn()).getValues();
+      tabData[tab] = { map: map, data: data };
+      for (var j = 0; j < data.length; j++) {
+        var jr = data[j];
+        if (String(jr[map['status'] - 1]) !== 'rejected') continue;
+        if (map['failure_mode'] && String(jr[map['failure_mode'] - 1]) === 'tp-no-data') continue;
+        var jm = map['model'] ? jr[map['model'] - 1] : '';
+        if (mode && !modelJudged_(jm, mode)) continue;
+        var jk = map['main_keyword'] ? normKw_(jr[map['main_keyword'] - 1]) : '';
+        if (jk) judgedKw[jk] = true;
+      }
+    });
+    var offeredKw = {};
+    tabs.forEach(function (tab) {
+      if (!tabData[tab]) return;
+      var map = tabData[tab].map;
+      var data = tabData[tab].data;
+      for (var r = 0; r < data.length; r++) {
+        var row = data[r];
+        var status = String(row[map['status'] - 1]);
+        var generic = String(row[map['generic'] - 1]);
+        var safety = String(row[map['safety_verdict'] - 1]);
+        if (generic !== 'yes' || safety !== 'clear') continue;
+        var kw = map['main_keyword'] ? normKw_(row[map['main_keyword'] - 1]) : '';
+        var fresh = status === 'idea' && !(kw && judgedKw[kw]);
+        var noData = map['failure_mode'] && String(row[map['failure_mode'] - 1]) === 'tp-no-data';
+        var retry = status === 'rejected' &&
+          (noData || (mode && !modelJudged_(map['model'] ? row[map['model'] - 1] : '', mode)));
+        if (!fresh && !retry) continue;
+        // one Terapeak search per niche per run
+        if (kw && offeredKw[kw]) continue;
+        if (kw) offeredKw[kw] = true;
+        (fresh ? ideas : retries).push({
+          slug: String(row[map['slug'] - 1]),
+          title: String(row[map['title'] - 1]),
+          source: String(row[map['source'] - 1]),
+          main_keyword: map['main_keyword']
+            ? String(row[map['main_keyword'] - 1] || '')
+            : '',
+          // why this row is offered: fresh idea, or a retry under the other model
+          status: status,
+          model: map['model'] ? String(row[map['model'] - 1] || '') : '',
+          date: map['date'] ? String(row[map['date'] - 1] || '') : '',
+        });
+      }
+    });
+    return ContentService.createTextOutput(
+      // oldest ideas first ACROSS tabs — a deep Amazon backlog used to starve the others
+      JSON.stringify({ ok: true, ideas: ideas.sort(byDate_).concat(retries.sort(byDate_)).slice(0, limit) })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+  // ?action=winners&limit=N -> Hunted Verified rows for the lister (v69):
+  // identity, economics, score and listing_status so a lister can pick the
+  // next product and see which ones are already drafted / listed
+  if (e && e.parameter && e.parameter.action === 'winners') {
+    var wlimit = Math.min(Number(e.parameter.limit) || 50, 200);
+    var wsh = getTab_(LISTING_TAB);
+    var wmap = headerMap_(wsh);
+    var winners = [];
+    var wLast = wsh.getLastRow();
+    if (wLast > HEADER_ROW) {
+      var wData = wsh.getRange(HEADER_ROW + 1, 1, wLast - HEADER_ROW, wsh.getLastColumn()).getValues();
+      var wFields = ['slug', 'title', 'main_keyword', 'model', 'source_url', 'supplier_url', 'lane',
+        'supplier_cost_gbp', 'ebay_price_gbp', 'score', 'trend', 'velocity',
+        'units_30d', 'sellers_broad', 'total_sales_gbp', 'top5_sold',
+        'listing_status', 'date_validated'];
+      for (var wr = 0; wr < wData.length && winners.length < wlimit; wr++) {
+        var wrow = wData[wr];
+        if (!String(wrow[wmap['slug'] - 1] || '').trim()) continue;
+        var wobj = { row: HEADER_ROW + 1 + wr };
+        wFields.forEach(function (f) {
+          if (wmap[f]) wobj[f] = wrow[wmap[f] - 1];
+        });
+        winners.push(wobj);
+      }
+    }
+    return ContentService.createTextOutput(
+      JSON.stringify({ ok: true, winners: winners })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+  // ?action=rows&tab=Hunted%20Verified&last=N -> the last N rows of a managed
+  // tab keyed by field, with row colour — for checking cells without the UI (v76)
+  if (e && e.parameter && e.parameter.action === 'rows') {
+    var rtab = e.parameter.tab || LISTING_TAB;
+    if (ALL_TABS.indexOf(rtab) === -1) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'unknown tab' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    var rn = Math.min(Number(e.parameter.last) || 2, 25);
+    var rsh = getTab_(rtab);
+    var rLast = rsh.getLastRow();
+    var rCols = rsh.getLastColumn();
+    var rHdr = rsh.getRange(HEADER_ROW, 1, 1, rCols).getValues()[0];
+    var rowsOut = [];
+    var wantSlug = String(e.parameter.slug || '').trim();
+    if (rLast > HEADER_ROW) {
+      var rStart = Math.max(HEADER_ROW + 1, rLast - rn + 1);
+      var rCount = rLast - rStart + 1;
+      if (wantSlug) { rStart = HEADER_ROW + 1; rCount = rLast - HEADER_ROW; } // &slug= searches the whole tab
+      var rData = rsh.getRange(rStart, 1, rCount, rCols).getValues();
+      var rBg = rsh.getRange(rStart, 1, rCount, rCols).getBackgrounds();
+      var slugIdx = -1;
+      rHdr.forEach(function (h, c) { if (fieldFor_(rtab, String(h)) === 'slug') slugIdx = c; });
+      rData.forEach(function (r, i) {
+        if (wantSlug && (slugIdx < 0 || String(r[slugIdx]).trim() !== wantSlug)) return;
+        var o = { row: rStart + i, bg: rBg[i][0] };
+        rHdr.forEach(function (h, c) { o[fieldFor_(rtab, String(h))] = r[c]; });
+        rowsOut.push(o);
+      });
+    }
+    return ContentService.createTextOutput(
+      JSON.stringify({ ok: true, tab: rtab, rows: rowsOut })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+  // ?action=diag&slug=X[&write=1] -> where a slug resolves, what sits in its
+  // Terapeak evidence cells, and (write=1) whether a traced write lands (v83)
+  if (e && e.parameter && e.parameter.action === 'diag') {
+    var dslug = String(e.parameter.slug || '').trim();
+    var dout = { ok: true, slug: dslug, spreadsheet: SpreadsheetApp.getActiveSpreadsheet().getName() };
+    try {
+      var dloc = buildIndex_().slug[dslug];
+      dout.found = !!dloc;
+      if (dloc) {
+        dout.tab = dloc.sh.getName(); dout.row = dloc.rowNum;
+        dout.maxCols = dloc.sh.getMaxColumns(); dout.lastCol = dloc.sh.getLastColumn();
+        dout.cells = {};
+        ['top5_sold', 'active_listings', 'listings_removed', 'sellers_broad', 'model'].forEach(function (f) {
+          var col = dloc.map[f];
+          if (!col) { dout.cells[f] = null; return; }
+          var rg = dloc.sh.getRange(dloc.rowNum, col);
+          var dv = rg.getDataValidation();
+          dout.cells[f] = { col: col, value: rg.getValue(), formula: rg.getFormula(),
+            validation: dv ? String(dv.getCriteriaType()) : null };
+        });
+        dout.protections = dloc.sh.getProtections(SpreadsheetApp.ProtectionType.RANGE)
+          .map(function (p) { return p.getRange().getA1Notation(); });
+        if (String(e.parameter.write) === '1') {
+          try {
+            writeFields_(dloc.sh, dloc.map, dloc.rowNum, { top5_sold: '-', active_listings: '-', listings_removed: '-' });
+            SpreadsheetApp.flush();
+            dout.write = 'ok';
+            dout.after = {};
+            ['top5_sold', 'active_listings', 'listings_removed'].forEach(function (f) {
+              dout.after[f] = dloc.sh.getRange(dloc.rowNum, dloc.map[f]).getValue();
+            });
+          } catch (werr) { dout.write = 'error: ' + werr; }
+        }
+      }
+      logWrite_('diag', dslug, dout.tab || '-', '', 'diag');
+      logFlush_();
+      dout.log = LOG_LAST_ERROR_ ? 'error: ' + LOG_LAST_ERROR_ : 'ok';
+    } catch (err) { dout.ok = false; dout.error = String(err); }
+    return ContentService.createTextOutput(JSON.stringify(dout)).setMimeType(ContentService.MimeType.JSON);
+  }
+  // ?action=log&last=N -> newest write-log lines (v79)
+  if (e && e.parameter && e.parameter.action === 'log') {
+    var ln = Math.min(Number(e.parameter.last) || 20, 100);
+    var lsh0 = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LOG_TAB);
+    var lines = [];
+    if (lsh0 && lsh0.getLastRow() > 1) {
+      var lcount = Math.min(ln, lsh0.getLastRow() - 1);
+      lsh0.getRange(2, 1, lcount, 6).getValues().forEach(function (r) {
+        lines.push({ when: r[0], kind: r[1], slug: r[2], landed: r[3], fields: r[4], note: r[5] });
+      });
+    }
+    return ContentService.createTextOutput(
+      JSON.stringify({ ok: true, log: lines })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+  // ?action=layout -> banner/header/colour audit of every tab (v72)
+  if (e && e.parameter && e.parameter.action === 'layout') {
+    return ContentService.createTextOutput(
+      JSON.stringify({ ok: true, layout: layoutReport_() })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+  // ?action=suppliers&limit=N -> Listing rows still missing a supplier_url
+  if (e && e.parameter && e.parameter.action === 'suppliers') {
+    var slimit = Math.min(Number(e.parameter.limit) || 10, 25);
+    var lsh = getTab_(LISTING_TAB);
+    var lmap = headerMap_(lsh);
+    var need = [];
+    var lLast = lsh.getLastRow();
+    if (lLast > HEADER_ROW) {
+      // one block read — the per-cell version was 5+ Range calls per row
+      var lData = lsh.getRange(HEADER_ROW + 1, 1, lLast - HEADER_ROW, lsh.getLastColumn()).getValues();
+      for (var lr = 0; lr < lData.length && need.length < slimit; lr++) {
+        var lrow = lData[lr];
+        var lslug = String(lrow[lmap['slug'] - 1] || '');
+        if (!lslug) continue;
+        if (String(lrow[lmap['supplier_url'] - 1] || '').trim()) continue;
+        need.push({
+          slug: lslug,
+          title: String(lrow[lmap['title'] - 1] || ''),
+          main_keyword: String(lrow[lmap['main_keyword'] - 1] || ''),
+          source_url: String(lrow[lmap['source_url'] - 1] || ''),
+          supplier_cost_gbp: numeric_(lrow[lmap['supplier_cost_gbp'] - 1]) || '',
+        });
+      }
+    }
+    return ContentService.createTextOutput(
+      JSON.stringify({ ok: true, suppliers: need })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+  // ?action=rank (v89) -> order Hunted Verified best-first: rows that passed
+  // both models, then stock winners, then dropship winners, score deciding
+  // within a tier; blank rows sink. The extension calls it when a Validate
+  // run ends. A write, so it needs the token when one is set.
+  if (e && e.parameter && e.parameter.action === 'rank') {
+    if (!authOk_(e.parameter.token)) {
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'unauthorised — check the pipeline token' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    var ranked = rankWinners_(getTab_(LISTING_TAB));
+    return ContentService.createTextOutput(
+      JSON.stringify({ ok: true, ranked: ranked })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+  var counts = {};
+  ALL_TABS.forEach(function (t) { counts[t] = Math.max(0, getTab_(t).getLastRow() - HEADER_ROW); });
+  return ContentService.createTextOutput(
+    // sheetId (v90): the extension shows its panel only on THIS sheet
+    JSON.stringify({ ok: true, service: 'HuntToList pipeline v90', tabs: counts, sheetId: SpreadsheetApp.getActiveSpreadsheet().getId() })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Run ▶ dumpLayout — prints every tab's banner row, header row, header
+ * colours and first data row to the execution log, so the layout can be
+ * audited without opening the sheet. Also served as ?action=layout.
+ */
+function layoutReport_() {
+  var out = {};
+  ALL_TABS.forEach(function (t) {
+    var sh = getTab_(t);
+    var lastCol = Math.max(sh.getLastColumn(), 1);
+    var banner = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+    var bannerBg = sh.getRange(1, 1, 1, lastCol).getBackgrounds()[0];
+    var hdr = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+    var hdrBg = sh.getRange(HEADER_ROW, 1, 1, lastCol).getBackgrounds()[0];
+    var merges = sh.getRange(1, 1, 1, lastCol).getMergedRanges().map(function (m) {
+      return m.getColumn() + '-' + m.getLastColumn();
+    });
+    var cols = [];
+    for (var c = 0; c < lastCol; c++) {
+      cols.push({
+        col: c + 1, header: String(hdr[c]), field: fieldFor_(t, String(hdr[c]).trim()),
+        hdrBg: hdrBg[c], banner: String(banner[c]), bannerBg: bannerBg[c],
+      });
+    }
+    var rows = Math.max(0, sh.getLastRow() - HEADER_ROW);
+    var sample = rows ? sh.getRange(HEADER_ROW + 1, 1, 1, lastCol).getValues()[0] : [];
+    var sampleBg = rows ? sh.getRange(HEADER_ROW + 1, 1, 1, lastCol).getBackgrounds()[0] : [];
+    out[t] = { rows: rows, maxCols: sh.getMaxColumns(), merges: merges, cols: cols, sample: sample, sampleBg: sampleBg };
+  });
+  return out;
+}
+function dumpLayout() {
+  var rep = layoutReport_();
+  Object.keys(rep).forEach(function (t) {
+    var r = rep[t];
+    Logger.log('=== ' + t + ' rows=' + r.rows + ' maxCols=' + r.maxCols + ' merges=' + r.merges.join(','));
+    r.cols.forEach(function (c) {
+      Logger.log(c.col + ' | ' + c.header + ' | ' + c.field + ' | hdr ' + c.hdrBg + ' | banner "' + c.banner + '" ' + c.bannerBg);
+    });
+    Logger.log('sample: ' + JSON.stringify(r.sample));
+    Logger.log('sampleBg: ' + JSON.stringify(r.sampleBg));
+  });
+}
+
+/**
+ * Run ▶ rebuildListing — rebuilds the Listing tab on the lean v14 schema.
+ * Defensive: finds the header row wherever it is (survives botched layouts),
+ * breaks every merge BEFORE writing (merged banners confuse appendRow), and
+ * trims leftover columns. Safe to re-run any time.
+ */
+function rebuildListing() {
+  var sh = getTab_(LISTING_TAB);
+  // 1) salvage existing rows by locating the 'slug' header anywhere in the grid
+  var rows = [];
+  var lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+  if (lastRow > 0) {
+    var grid = sh.getRange(1, 1, Math.min(lastRow, 1000), Math.max(lastCol, 1)).getValues();
+    var hr = -1, headerIdx = {};
+    for (var r = 0; r < Math.min(grid.length, 5) && hr < 0; r++) {
+      for (var c = 0; c < grid[r].length; c++) {
+        if (String(grid[r][c]).trim() === 'slug') { hr = r; break; }
+      }
+    }
+    if (hr >= 0) {
+      grid[hr].forEach(function (h, c2) {
+        // key by INTERNAL field name so labelled columns ("Total sold (30d)",
+        // "eBay Avg price") survive the rebuild
+        h = fieldFor_(LISTING_TAB, String(h).trim());
+        if (h && headerIdx[h] === undefined) headerIdx[h] = c2;
+      });
+      for (var dr = hr + 1; dr < grid.length; dr++) {
+        var obj = {};
+        Object.keys(headerIdx).forEach(function (h) {
+          var v = grid[dr][headerIdx[h]];
+          if (v !== '' && v !== null) obj[h] = v;
+        });
+        if (obj.slug) rows.push(obj);
+      }
+    }
+  }
+  // 2) wipe clean — merges FIRST, then content, then surplus columns
+  sh.getRange(1, 1, sh.getMaxRows(), sh.getMaxColumns()).breakApart();
+  sh.clear();
+  if (sh.getMaxColumns() > LISTING_HEADERS.length) {
+    sh.deleteColumns(LISTING_HEADERS.length + 1, sh.getMaxColumns() - LISTING_HEADERS.length);
+  }
+  // 3) exact-position writes (never appendRow on a sheet that had merges)
+  sh.getRange(HEADER_ROW, 1, 1, LISTING_HEADERS.length)
+    .setValues([LISTING_HEADERS.map(function (h) { return labelFor_(LISTING_TAB, h); })])
+    .setFontWeight('bold');
+  var newMap = headerMap_(sh);
+  rows.forEach(function (d, i) {
+    if (!d.ebay_title || d.ebay_title === String(d.title || '').slice(0, 80)) {
+    }
+    d.source_url = d.source_url || d.url;
+    var rowNum = HEADER_ROW + 1 + i;
+    writeFields_(sh, newMap, rowNum, d);
+    setEconFormulas_(sh, newMap, rowNum);
+    paintRow_(sh, rowNum, COLOR_VALIDATED);
+    paintListingStatus_(sh, rowNum, d.listing_status);
+  });
+  formatBanner_(sh);
+}
+
+
+
+

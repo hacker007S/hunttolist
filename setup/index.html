@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HuntToList — Sheet setup</title>
+<link rel="icon" href="../icon128.png">
+<style>
+:root{--bg:#0b1524;--card:#101d31;--line:rgba(255,255,255,.09);--fg:#e8eef7;--mut:#9fb0c7;--teal:#2ec4b0;--blue:#2f80ed}
+*{box-sizing:border-box;margin:0}
+body{background:linear-gradient(135deg,#16263d,#0e1b2e 45%,var(--bg));color:var(--fg);font:16px/1.6 "Helvetica Neue",Helvetica,Arial,sans-serif;min-height:100vh}
+.wrap{max-width:780px;margin:0 auto;padding:48px 20px 80px}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:34px}
+.brand img{width:44px;height:44px;border-radius:11px}
+.brand b{font-size:22px}.brand b i{font-style:normal;background:linear-gradient(90deg,var(--teal),var(--blue));-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand span{font-size:13px;color:var(--mut);border:1px solid var(--line);border-radius:999px;padding:4px 12px;margin-left:auto}
+h1{font-size:34px;letter-spacing:-1px;line-height:1.15;margin-bottom:10px}
+.lead{color:var(--mut);margin-bottom:30px}
+.step{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 22px;margin-bottom:14px}
+.step h2{font-size:18px;margin-bottom:8px;display:flex;align-items:center;gap:10px}
+.n{flex:none;width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-size:14px;font-weight:700;color:#06241a;background:linear-gradient(135deg,var(--teal),#5ad0ff)}
+.step p, .step li{color:var(--mut);font-size:15px}
+.step ol{padding-left:20px;display:grid;gap:4px;margin-top:6px}
+.step b{color:var(--fg);font-weight:600}
+button.copy{margin:10px 8px 2px 0;font:600 14px/1 inherit;color:#06241a;background:linear-gradient(135deg,var(--teal),#4ab8ff);border:0;border-radius:10px;padding:11px 18px;cursor:pointer}
+button.copy:active{transform:translateY(1px)}
+a{color:#7fd8c8}
+code{background:rgba(255,255,255,.08);border-radius:6px;padding:1px 6px;font-size:13.5px;color:var(--fg)}
+.note{font-size:13.5px;color:var(--mut);border-left:3px solid var(--teal);padding-left:12px;margin-top:12px}
+.foot{margin-top:36px;color:var(--mut);font-size:13.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand"><img src="../icon128.png" alt=""><b>Hunt<i>ToList</i></b><span>Sheet setup · ~10 minutes</span></div>
+  <h1>Your research sheet, in six small steps</h1>
+  <p class="lead">HuntToList files everything into a Google Sheet <b style="color:#e8eef7">you own</b> — there is no HuntToList server. One script, pasted once, turns a blank sheet into the whole pipeline.</p>
+
+  <div class="step"><h2><span class="n">1</span>Create a blank sheet</h2>
+    <p>Go to <a href="https://sheets.new" target="_blank" rel="noopener">sheets.new</a> and name it, e.g. <b>HuntToList Pipeline</b>. Don't create any tabs — the script builds them all.</p></div>
+
+  <div class="step"><h2><span class="n">2</span>Paste the script</h2>
+    <ol>
+      <li>In the sheet: <b>Extensions → Apps Script</b>.</li>
+      <li>Delete everything in the editor, then paste the script:</li>
+    </ol>
+    <button class="copy" data-src="Code.gs.txt">Copy the script (Code.gs)</button>
+    <button class="copy" data-src="appsscript.json.txt">Copy appsscript.json</button>
+    <p class="note">For appsscript.json: <b>Project Settings ⚙ → tick “Show appsscript.json”</b>, open it, paste over. It sets the London timezone and the exact permissions. Save with ⌘S / Ctrl+S.</p></div>
+
+  <div class="step"><h2><span class="n">3</span>First run</h2>
+    <ol>
+      <li>Function picker → <b>formatSheets</b> → <b>Run</b>.</li>
+      <li>Google asks to authorise: your account → <b>Advanced</b> → <b>Go to … (unsafe)</b> → <b>Allow</b>. It's your own script in your own account.</li>
+      <li>Wait ~1 minute for “Execution completed”. Every tab now exists.</li>
+    </ol></div>
+
+  <div class="step"><h2><span class="n">4</span>Deploy as a web app</h2>
+    <ol>
+      <li><b>Deploy → New deployment</b> → ⚙ Select type → <b>Web app</b>.</li>
+      <li><i>Execute as</i> <b>Me</b> · <i>Who has access</i> <b>Anyone</b>.</li>
+      <li><b>Deploy</b>, then copy the <b>Web app URL</b> (<code>…/exec</code>).</li>
+    </ol>
+    <p class="note">The URL is a long secret. For a second lock, set <code>api_token</code> on the sheet's Settings tab and the same value in the extension's <i>Pipeline token</i>.</p></div>
+
+  <div class="step"><h2><span class="n">5</span>Connect the extension</h2>
+    <p>Extension icon → <b>⚙ Settings</b> → paste the URL into <b>Pipeline URL</b> → <b>Test connection</b>. Expect: <i>“Connected — HuntToList pipeline v90”</i>. Save.</p></div>
+
+  <div class="step"><h2><span class="n">6</span>Tune it (optional)</h2>
+    <p>The sheet's <b>Settings</b> tab controls winner-alert emails, your eBay fee model (business or private, category fee %, VAT) — edit a cell and every winner row's profit recomputes live.</p></div>
+
+  <p class="foot">Upgrading later: paste the new script over the old → Save → <b>Run ▶ formatSheets</b> → <b>Deploy → Manage deployments → ✏️ → New version</b>.<br>
+  Stuck? <a href="mailto:zahoor@pycode.co.uk">zahoor@pycode.co.uk</a> · <a href="../privacy/">Privacy</a> · © Pycode Ltd</p>
+</div>
+<script>
+for (const b of document.querySelectorAll('button.copy')) b.addEventListener('click', async () => {
+  const r = await fetch(b.dataset.src); const t = await r.text();
+  await navigator.clipboard.writeText(t);
+  const old = b.textContent; b.textContent = 'Copied ✓'; setTimeout(() => b.textContent = old, 1600);
+});
+</script>
+</body>
+</html>
