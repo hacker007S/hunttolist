@@ -1,5 +1,5 @@
 /**
- * HuntToList backend v90 — Google Apps Script web app bound to the research sheet.
+ * HuntGo backend v91 — Google Apps Script web app bound to the research sheet.
  * (the version the API reports lives in doGet: search "service:")
  *
  * Tabs: "Amazon Hunting", "AliExpress Hunting", "eBay Hunting" (ideas per
@@ -235,6 +235,7 @@ function formatBanner_(sh) {
       }
     }
     sh.setFrozenRows(HEADER_ROW);
+    applyFeeMode_(sh);
     return;
   }
   var srcLabel = TAB_BANNER[name] || name.toUpperCase().replace(' HUNTING', ' DATA');
@@ -261,6 +262,27 @@ function formatBanner_(sh) {
     }
   }
   sh.setFrozenRows(HEADER_ROW);
+}
+
+/**
+ * Show the active fee mode on the eBay fee header, without touching the header
+ * TEXT (fieldFor_ maps that text back to the field). Green tint + a note in
+ * private mode; the normal economics tint and no note in business mode. (v91)
+ */
+var ECON_HEADER_TINT = '#fff2cc';
+var PRIVATE_HEADER_TINT = '#d9ead3';
+function applyFeeMode_(sh) {
+  try {
+    if (!sh || sh.getName() !== LISTING_TAB) return;
+    var map = headerMap_(sh);
+    if (!map.ebay_fee_gbp) return;
+    var isPrivate = String(settingGet_('seller_type')).trim().toLowerCase() === 'private';
+    var cell = sh.getRange(HEADER_ROW, map.ebay_fee_gbp);
+    cell.setBackground(isPrivate ? PRIVATE_HEADER_TINT : ECON_HEADER_TINT);
+    cell.setNote(isPrivate
+      ? 'Private seller: eBay fees are £0. Buyers pay eBay’s Buyer Protection fee instead. Switch via the HuntGo menu or Settings ▸ seller_type.'
+      : '');
+  } catch (err) { /* cosmetic only, never break a format run */ }
 }
 
 /** Shift every Terapeak column to the far right, in canonical order. */
@@ -570,15 +592,45 @@ function orderWinnerCols_(sh) {
   orderToSchema_(sh, LISTING_HEADERS);
 }
 
+/** Build the HuntGo menu on open so fees can be switched from any tab. */
+function onOpen() {
+  try {
+    SpreadsheetApp.getUi().createMenu('HuntGo')
+      .addItem('eBay fees: switch to Private seller', 'htlSetPrivate_')
+      .addItem('eBay fees: switch to Business seller', 'htlSetBusiness_')
+      .addToUi();
+  } catch (err) { /* no UI in some contexts */ }
+}
+function htlSetPrivate_() { setSellerType_('private'); }
+function htlSetBusiness_() { setSellerType_('business'); }
+
+/** Write the seller-type mode, refresh the fee-column indicator, and toast. */
+function setSellerType_(mode) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  settingsSheet_(); // guarantees the Settings tab, its rows and the named range
+  var rng = ss.getRangeByName('HTL_SELLER_TYPE');
+  if (rng) rng.setValue(mode);
+  applyFeeMode_(ss.getSheetByName(LISTING_TAB));
+  try { ss.toast('eBay fees set to ' + mode + ' seller.', 'HuntGo', 4); } catch (err) { /* toast optional */ }
+}
+
 /**
  * Simple trigger (v71): editing Listing status or Model by hand recolours the
  * row at once — Yes -> sky blue, stock winner -> amber, otherwise the
  * validated green — instead of waiting for the next formatSheets run.
+ * Editing the Settings seller_type cell refreshes the fee-column indicator.
  */
 function onEdit(e) {
   try {
     if (!e || !e.range) return;
     var sh = e.range.getSheet();
+    if (sh.getName() === SETTINGS_TAB) {
+      var lbl = String(sh.getRange(e.range.getRow(), 1).getValue()).trim();
+      if (e.range.getColumn() === 2 && lbl === 'seller_type') {
+        applyFeeMode_(sh.getParent().getSheetByName(LISTING_TAB));
+      }
+      return;
+    }
     if (sh.getName() !== LISTING_TAB) return;
     var top = e.range.getRow();
     if (top <= HEADER_ROW) return;
@@ -1391,7 +1443,7 @@ var SETTINGS_DEFAULTS = [
   ['alert_email', '', 'Where winner alerts are sent. Blank = the Google account that owns this script.'],
   ['alerts', 'on', 'on / off — email when a product passes Terapeak'],
   ['weekly_retro', 'on', 'on / off — Monday 8am summary email (needs Run ▶ setupTriggers once)'],
-  ['brand', 'HuntToList', 'Name shown in emails'],
+  ['brand', 'HuntGo', 'Name shown in emails'],
   ['api_token', '', 'Optional. When set, the extension must send the same token (Options ▸ Pipeline token).'],
   // ---- eBay UK fee model (business seller, Aug 2026). Edit here; every winner row recomputes live.
   ['fvf_pct', 11.9, 'Final value fee % for your main category (Home & Garden 11.9, most categories 12.9, Business & Industrial 12.5, Books/Media 9.9).'],
@@ -1441,6 +1493,16 @@ function settingsSheet_() {
       if (existing[name]) existing[name].setRange(rng); else ss.setNamedRange(name, rng);
     });
   }
+  // one-click seller-type toggle: a two-choice dropdown, no free typing (v91)
+  if (rowOf['seller_type']) {
+    var stCell = sh.getRange(rowOf['seller_type'], 2);
+    var stRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(['business', 'private'], true)
+      .setAllowInvalid(false)
+      .setHelpText('business or private. Private sellers pay no eBay selling fees.')
+      .build();
+    stCell.setDataValidation(stRule);
+  }
   return sh;
 }
 /** the API token a customer may set on the Settings tab ('' = open) */
@@ -1469,7 +1531,7 @@ function ownerEmail_() {
   if (custom && custom.indexOf('@') > 0) return custom;
   return Session.getEffectiveUser().getEmail() || '';
 }
-function brandName_() { return settingGet_('brand') || 'HuntToList'; }
+function brandName_() { return settingGet_('brand') || 'HuntGo'; }
 
 /** 🏆 Instant alert when a product passes Terapeak and lands in Listing. */
 function notifyWinner_(rec) {
@@ -2128,7 +2190,7 @@ function doGetLocked_(e) {
   ALL_TABS.forEach(function (t) { counts[t] = Math.max(0, getTab_(t).getLastRow() - HEADER_ROW); });
   return ContentService.createTextOutput(
     // sheetId (v90): the extension shows its panel only on THIS sheet
-    JSON.stringify({ ok: true, service: 'HuntToList pipeline v90', tabs: counts, sheetId: SpreadsheetApp.getActiveSpreadsheet().getId() })
+    JSON.stringify({ ok: true, service: 'HuntGo pipeline v91', tabs: counts, sheetId: SpreadsheetApp.getActiveSpreadsheet().getId() })
   ).setMimeType(ContentService.MimeType.JSON);
 }
 

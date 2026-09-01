@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HuntToList — Sheet setup</title>
+<title>HuntGo — Sheet setup</title>
 <link rel="icon" href="../icon128.png">
 <style>
 :root{--bg:#0b1524;--card:#101d31;--line:rgba(255,255,255,.09);--fg:#e8eef7;--mut:#9fb0c7;--teal:#2ec4b0;--blue:#2f80ed}
@@ -34,10 +34,10 @@ code{background:rgba(255,255,255,.08);border-radius:6px;padding:1px 6px;font-siz
 <div class="wrap">
   <div class="brand"><img src="../icon128.png" alt=""><b>Hunt<i>ToList</i></b><span>Sheet setup · ~10 minutes</span></div>
   <h1>Your research sheet, in seven small steps</h1>
-  <p class="lead">HuntToList files everything into a Google Sheet <b style="color:#e8eef7">you own</b> — there is no HuntToList server. One script, pasted once, turns a blank sheet into the whole pipeline.</p>
+  <p class="lead">HuntGo files everything into a Google Sheet <b style="color:#e8eef7">you own</b> — there is no HuntGo server. One script, pasted once, turns a blank sheet into the whole pipeline.</p>
 
   <div class="step"><h2><span class="n">1</span>Create a blank sheet</h2>
-    <p>Go to <a href="https://sheets.new" target="_blank" rel="noopener">sheets.new</a> and name it, e.g. <b>HuntToList Pipeline</b>. Don't create any tabs — the script builds them all.</p></div>
+    <p>Go to <a href="https://sheets.new" target="_blank" rel="noopener">sheets.new</a> and name it, e.g. <b>HuntGo Pipeline</b>. Don't create any tabs — the script builds them all.</p></div>
 
   <div class="step"><h2><span class="n">2</span>Paste the script</h2>
     <ol>
@@ -59,7 +59,7 @@ code{background:rgba(255,255,255,.08);border-radius:6px;padding:1px 6px;font-siz
     <ol>
       <li>Still in the Apps Script editor, click the blue <b>Deploy</b> button (top-right) → <b>New deployment</b>.</li>
       <li>In the dialog, click the <b>⚙ gear</b> next to “Select type” and choose <b>Web app</b>.</li>
-      <li>Fill the three fields:<br>· <i>Description</i> — anything, e.g. <code>HuntToList</code><br>· <i>Execute as</i> — <b>Me (your email)</b><br>· <i>Who has access</i> — <b>Anyone</b> ← this one matters</li>
+      <li>Fill the three fields:<br>· <i>Description</i> — anything, e.g. <code>HuntGo</code><br>· <i>Execute as</i> — <b>Me (your email)</b><br>· <i>Who has access</i> — <b>Anyone</b> ← this one matters</li>
       <li>Click <b>Deploy</b>. If Google asks to authorise again: <b>Authorise access</b> → your account → <b>Advanced</b> → <b>Go to … (unsafe)</b> → <b>Allow</b>.</li>
       <li>You'll see two URLs. Copy the <b>Web app</b> one — it ends in <code>/exec</code> — with the <b>Copy</b> button under it. Then click <b>Done</b>.</li>
     </ol>
@@ -67,10 +67,10 @@ code{background:rgba(255,255,255,.08);border-radius:6px;padding:1px 6px;font-siz
 
   <div class="step"><h2><span class="n">5</span>Connect the extension</h2>
     <ol>
-      <li>In Chrome, click the <b>HuntToList icon</b> in the toolbar (pin it via the 🧩 puzzle icon if hidden).</li>
+      <li>In Chrome, click the <b>HuntGo icon</b> in the toolbar (pin it via the 🧩 puzzle icon if hidden).</li>
       <li>Click the <b>⚙ gear</b> at the top of the popup — the Settings page opens.</li>
       <li>Go to the <b>Pipeline</b> section and paste your <code>/exec</code> URL into <b>Pipeline URL</b>.</li>
-      <li>Click <b>Test connection</b>. Expect: <i>“Connected — HuntToList pipeline v90”</i>.</li>
+      <li>Click <b>Test connection</b>. Expect: <i>“Connected — HuntGo pipeline v90”</i>.</li>
       <li>Click <b>Save settings</b> (bottom-left).</li>
     </ol></div>
 
